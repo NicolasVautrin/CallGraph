@@ -24,7 +24,7 @@ class TsUsage:
     string_context: Optional[str] = None  # Context where string appears
 
 
-class TypeScriptGraphExtractor:
+class TypeScriptASTExtractor:
     """Extracts call graph from TypeScript/TSX files using tree-sitter"""
 
     def __init__(self):
@@ -424,60 +424,3 @@ class TypeScriptGraphExtractor:
 
         visit(node)
         return usages
-
-
-def main():
-    """Test the extractor on a file or directory"""
-    if len(sys.argv) < 2:
-        print("Usage: python extract_typescript_graph.py <ts-file-or-directory>")
-        sys.exit(1)
-
-    path = Path(sys.argv[1])
-
-    if not path.exists():
-        print(f"Error: Path not found: {path}")
-        sys.exit(1)
-
-    extractor = TypeScriptGraphExtractor()
-    all_usages = []
-
-    # Process file(s)
-    if path.is_file():
-        files = [path]
-    else:
-        files = list(path.rglob("*.ts")) + list(path.rglob("*.tsx"))
-
-    print(f"Processing {len(files)} TypeScript files...")
-
-    for ts_file in files:
-        try:
-            usages = extractor.extract_from_file(ts_file)
-            all_usages.extend(usages)
-        except Exception as e:
-            print(f"Error processing {ts_file}: {e}")
-
-    # Display statistics
-    print(f"\nExtracted {len(all_usages)} usages:")
-
-    by_type = {}
-    for usage in all_usages:
-        by_type[usage.usage_type] = by_type.get(usage.usage_type, 0) + 1
-
-    for usage_type, count in sorted(by_type.items()):
-        print(f"  {usage_type}: {count}")
-
-    # Show some examples
-    print("\nExample usages:")
-    for usage in all_usages[:15]:
-        print(f"\n{usage.usage_type}: {usage.callee_name}")
-        if usage.caller_function:
-            print(f"  In: {usage.caller_function}()")
-        print(f"  At: {Path(usage.caller_file).name}:{usage.caller_line}")
-        if usage.callee_module:
-            print(f"  From: {usage.callee_module}")
-        if usage.string_context:
-            print(f"  Context: {usage.string_context}")
-
-
-if __name__ == "__main__":
-    main()

@@ -44,6 +44,16 @@ class AxelorRepoManager:
 
     def _detect_platform_version(self) -> Optional[str]:
         """Detect axelor-open-platform version from build files"""
+        # Check settings.gradle (modern Gradle format)
+        settings_gradle = self.project_root / "settings.gradle"
+        if settings_gradle.exists():
+            with open(settings_gradle, 'r', encoding='utf-8') as f:
+                content = f.read()
+                # Pattern: id 'com.axelor.app' version '7.2.3'
+                match = re.search(r"id\s+['\"]com\.axelor\.app['\"]\s+version\s+['\"]([0-9.]+)['\"]", content)
+                if match:
+                    return match.group(1)
+
         # Check gradle.properties
         gradle_props = self.project_root / "gradle.properties"
         if gradle_props.exists():
@@ -257,48 +267,3 @@ class AxelorRepoManager:
             repos['suite'] = self.get_repo_path('suite', suite_version)
 
         return repos
-
-
-def main():
-    """Test the repo manager"""
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Fetch Axelor dependencies")
-    parser.add_argument("--project-root", type=str, default=".",
-                       help="Project root directory")
-    parser.add_argument("--platform-version", type=str,
-                       help="Platform version to fetch (auto-detect if not specified)")
-    parser.add_argument("--suite-version", type=str,
-                       help="Suite version to fetch (auto-detect if not specified)")
-
-    args = parser.parse_args()
-
-    manager = AxelorRepoManager(Path(args.project_root))
-
-    # Detect versions
-    platform_version, suite_version = manager.detect_axelor_versions()
-
-    print("=" * 60)
-    print("Detected versions:")
-    print(f"  Platform: {platform_version or 'Not detected'}")
-    print(f"  Suite: {suite_version or 'Not detected'}")
-    print("=" * 60)
-
-    # Use provided versions if specified
-    if args.platform_version:
-        platform_version = args.platform_version
-    if args.suite_version:
-        suite_version = args.suite_version
-
-    # Ensure repos are downloaded
-    repos = manager.ensure_repos(platform_version, suite_version)
-
-    print("\n" + "=" * 60)
-    print("Downloaded repositories:")
-    for repo_name, repo_path in repos.items():
-        print(f"  {repo_name}: {repo_path}")
-    print("=" * 60)
-
-
-if __name__ == "__main__":
-    main()

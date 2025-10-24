@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Call Graph Service - Business logic for querying call graph database
+Storage Reader - Business logic for querying call graph database
 Provides pagination, filtering, and impact analysis capabilities
 """
 
@@ -13,8 +13,8 @@ from chromadb.config import Settings
 logger = logging.getLogger(__name__)
 
 
-class CallGraphService:
-    """Service for querying call graph database with advanced features"""
+class StorageReader:
+    """Service for querying call graph database (Read operations)"""
 
     def __init__(self, db_path: str = ".vector-db"):
         """Initialize service

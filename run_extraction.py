@@ -18,8 +18,10 @@ def main():
                        help="Path to the repository (will cd to this directory)")
     parser.add_argument("--mode", type=str, choices=["full", "local"], default="full",
                        help="Extraction mode (default: full)")
-    parser.add_argument("--no-reset", action="store_true",
-                       help="Don't reset database before extraction")
+    parser.add_argument("--reset", type=str, choices=["true", "false"], default="true",
+                       help="Reset database before extraction (default: true)")
+    parser.add_argument("--limit", type=int, default=None,
+                       help="Limit number of entries to extract per repo (for testing)")
 
     args = parser.parse_args()
 
@@ -36,21 +38,27 @@ def main():
         print(f"Error: Not a directory: {repo_path}")
         sys.exit(1)
 
+    reset = args.reset.lower() == "true"
+
     print(f"Repository: {repo_path}")
     print(f"Extraction mode: {args.mode}")
-    print(f"Reset database: {not args.no_reset}")
+    print(f"Reset database: {reset}")
+    if args.limit:
+        print(f"Limit per repo: {args.limit} entries")
     print()
 
     # Build command
     cmd = [
         sys.executable,  # Use same Python interpreter
-        str(extracteurs_dir / "extraction_manager.py"),
+        str(extracteurs_dir / "ExtractionManager.py"),
         "--project-root", str(repo_path),
-        f"--{args.mode}"
+        f"--{args.mode}",
+        "--reset", "true" if reset else "false"
     ]
 
-    if args.no_reset:
-        cmd.append("--no-reset")
+    if args.limit:
+        cmd.append("--limit")
+        cmd.append(str(args.limit))
 
     # Run extraction with repo as working directory
     print(f"Running: {' '.join(cmd)}")

@@ -12,10 +12,10 @@ import sys
 import shutil
 
 # Import our modules
-from fetch_axelor_repos import AxelorRepoManager
-from build_call_graph_db import CallGraphDB
-from extract_java_graph import JavaCallGraphExtractor
-from extract_xml_graph import AxelorXmlExtractor
+from AxelorRepoManager import AxelorRepoManager
+from StorageWriter import StorageWriter
+from JavaASTExtractor import JavaASTExtractor
+from AxelorXmlExtractor import AxelorXmlExtractor
 
 
 class ExtractionManager:
@@ -58,7 +58,7 @@ class ExtractionManager:
 
         return repos
 
-    def _extract_repo_to_cache(self, repo_path: Path, cache_db_path: Path, all_repos: List[Path], use_embeddings: bool = False):
+    def _extract_repo_to_cache(self, repo_path: Path, cache_db_path: Path, all_repos: List[Path], use_embeddings: bool = False, limit: Optional[int] = None):
         """Extract a single repository to its cache database
 
         Args:
@@ -66,11 +66,12 @@ class ExtractionManager:
             cache_db_path: Path where to save the cache database
             all_repos: List of all repos for type resolution
             use_embeddings: Whether to use embeddings
+            limit: Optional limit on number of entries to extract per repo
         """
         print(f"\n  Extracting {repo_path.name} to cache...")
 
         # Create cache database
-        cache_db = CallGraphDB(db_path=str(cache_db_path), use_embeddings=use_embeddings)
+        cache_db = StorageWriter(db_path=str(cache_db_path), use_embeddings=use_embeddings)
         cache_db.reset()
 
         stats = {'java': 0, 'xml': 0}
@@ -83,8 +84,8 @@ class ExtractionManager:
         print(f"    Processing Java files (with {len(all_repos)} repos for resolution)...")
         java_batch = []
         try:
-            java_extractor = JavaCallGraphExtractor(repos=[str(r) for r in all_repos])
-            for source_type, entry in java_extractor.extract_all():
+            java_extractor = JavaASTExtractor(repos=[str(r) for r in all_repos])
+            for source_type, entry in java_extractor.extract_all(limit=limit):
                 # Filter: only keep entries from target repo
                 source_file = entry['metadata'].get('source_file', '')
                 source_file_normalized = source_file.replace('\\', '/')
@@ -106,7 +107,7 @@ class ExtractionManager:
         print(f"    Processing XML files...")
         xml_batch = []
         xml_extractor = AxelorXmlExtractor(repos=[str(repo_path)])
-        for source_type, entry in xml_extractor.extract_all():
+        for source_type, entry in xml_extractor.extract_all(limit=limit):
             xml_batch.append(entry)
             if len(xml_batch) >= batch_size:
                 cache_db.add_xml_references(xml_batch)
@@ -120,13 +121,14 @@ class ExtractionManager:
         print(f"  OK - Cached {stats['java']} Java + {stats['xml']} XML entries")
         return stats
 
-    def _extract_repo_into_db(self, repo_path: Path, db: CallGraphDB, all_repos: List[Path]):
+    def _extract_repo_into_db(self, repo_path: Path, db: StorageWriter, all_repos: List[Path], limit: Optional[int] = None):
         """Extract a repository and add to an existing database
 
         Args:
             repo_path: Path to repository to extract
             db: Database to add entries to
             all_repos: List of all repos for type resolution
+            limit: Optional limit on number of entries to extract per repo
         """
         batch_size = 500
 
@@ -136,8 +138,8 @@ class ExtractionManager:
         # Extract Java with all repos for resolution, filter results
         java_batch = []
         try:
-            java_extractor = JavaCallGraphExtractor(repos=[str(r) for r in all_repos])
-            for source_type, entry in java_extractor.extract_all():
+            java_extractor = JavaASTExtractor(repos=[str(r) for r in all_repos])
+            for source_type, entry in java_extractor.extract_all(limit=limit):
                 # Filter: only keep entries from target repo
                 source_file = entry['metadata'].get('source_file', '')
                 source_file_normalized = source_file.replace('\\', '/')
@@ -156,7 +158,7 @@ class ExtractionManager:
         # Extract XML (no type resolution needed, single repo)
         xml_batch = []
         xml_extractor = AxelorXmlExtractor(repos=[str(repo_path)])
-        for source_type, entry in xml_extractor.extract_all():
+        for source_type, entry in xml_extractor.extract_all(limit=limit):
             xml_batch.append(entry)
             if len(xml_batch) >= batch_size:
                 db.add_xml_references(xml_batch)
@@ -165,12 +167,13 @@ class ExtractionManager:
         if xml_batch:
             db.add_xml_references(xml_batch)
 
-    def extract_full(self, reset: bool = True, use_embeddings: bool = False):
+    def extract_full(self, reset: bool = True, use_embeddings: bool = False, limit: Optional[int] = None):
         """Full extraction: download Axelor repos + extract everything
 
         Args:
             reset: If True, reset the database before extraction
             use_embeddings: If True, use semantic embeddings (slower)
+            limit: Optional limit on number of entries to extract per repo
         """
         print("\n" + "="*60)
         print("FULL EXTRACTION")
@@ -191,9 +194,16 @@ class ExtractionManager:
 
         for repo_name, repo_path in axelor_repos.items():
             version = platform_version if repo_name == 'platform' else suite_version
+            cache_db_path = self.repo_manager.get_cached_db_path(repo_name, version, use_embeddings)
+
+            # If reset=True, delete existing cache and mark as missing
+            if reset and cache_db_path.exists():
+                print(f"\n[CACHE] Deleting cached DB for {repo_name} v{version} (reset mode)")
+                shutil.rmtree(cache_db_path)
+
+            # Check if cache exists (after potential deletion)
             if self.repo_manager.has_cached_db(repo_name, version, use_embeddings):
-                cached_db = self.repo_manager.get_cached_db_path(repo_name, version, use_embeddings)
-                cached_axelor[repo_name] = (repo_path, cached_db, version)
+                cached_axelor[repo_name] = (repo_path, cache_db_path, version)
                 print(f"\n[CACHE] Found cached DB for {repo_name} v{version}")
             else:
                 missing_axelor[repo_name] = (repo_path, version)
@@ -211,7 +221,7 @@ class ExtractionManager:
             for repo_name, (repo_path, version) in missing_axelor.items():
                 cache_db_path = self.repo_manager.get_cached_db_path(repo_name, version, use_embeddings)
                 print(f"\n[{repo_name.upper()}] v{version}")
-                self._extract_repo_to_cache(repo_path, cache_db_path, all_axelor_paths, use_embeddings)
+                self._extract_repo_to_cache(repo_path, cache_db_path, all_axelor_paths, use_embeddings, limit)
 
                 # Add to cached list
                 cached_axelor[repo_name] = (repo_path, cache_db_path, version)
@@ -242,17 +252,17 @@ class ExtractionManager:
 
             # If multiple Axelor repos, merge them
             if len(cached_axelor) > 1:
-                self.db = CallGraphDB(db_path=str(project_db_path), use_embeddings=use_embeddings)
+                self.db = StorageWriter(db_path=str(project_db_path), use_embeddings=use_embeddings)
 
                 all_axelor_paths = [repo_path for repo_name, repo_path in axelor_repos.items()]
 
                 for repo_name, (repo_path, cache_path, version) in list(cached_axelor.items())[1:]:
                     print(f"    Merging: {repo_name}")
                     # Extract this repo and add to project DB
-                    self._extract_repo_into_db(repo_path, self.db, all_axelor_paths)
+                    self._extract_repo_into_db(repo_path, self.db, all_axelor_paths, limit)
 
         # 5. Initialize DB connection
-        self.db = CallGraphDB(db_path=str(project_db_path), use_embeddings=use_embeddings)
+        self.db = StorageWriter(db_path=str(project_db_path), use_embeddings=use_embeddings)
 
         # 6. Extract local modules
         modules_dir = self.project_root / "modules"
@@ -296,12 +306,12 @@ class ExtractionManager:
         print("\n=== Processing Java files ===")
         print(f"  Using {len(all_repos_for_resolution)} repos for type resolution")
         try:
-            java_extractor = JavaCallGraphExtractor(repos=all_repos_for_resolution)
+            java_extractor = JavaASTExtractor(repos=all_repos_for_resolution)
 
             # Filter: only keep entries from local modules
             modules_dir_normalized = str(modules_dir.resolve()).replace('\\', '/')
 
-            for source_type, entry in java_extractor.extract_all():
+            for source_type, entry in java_extractor.extract_all(limit=limit):
                 # Filter: only keep entries from local modules
                 source_file = entry['metadata'].get('source_file', '')
                 source_file_normalized = source_file.replace('\\', '/')
@@ -321,7 +331,7 @@ class ExtractionManager:
         print("\n=== Processing XML files ===")
         xml_extractor = AxelorXmlExtractor(repos=[str(modules_dir)])
 
-        for source_type, entry in xml_extractor.extract_all():
+        for source_type, entry in xml_extractor.extract_all(limit=limit):
             xml_batch.append(entry)
 
             if len(xml_batch) >= batch_size:
@@ -338,11 +348,12 @@ class ExtractionManager:
         db_stats = self.db.get_stats()
         print(f"\n  Total in database: {db_stats['total_usages']}")
 
-    def extract_local(self, use_embeddings: bool = False):
+    def extract_local(self, use_embeddings: bool = False, limit: Optional[int] = None):
         """Extract only local repository (remove old entries first)
 
         Args:
             use_embeddings: If True, use semantic embeddings (slower)
+            limit: Optional limit on number of entries to extract per repo
         """
         print("\n" + "="*60)
         print("LOCAL EXTRACTION")
@@ -364,9 +375,9 @@ class ExtractionManager:
         print(f"Database path: {db_path}")
         print(f"Mode: {'Semantic (with embeddings)' if use_embeddings else 'Raw (metadata only)'}")
 
-        self.db = CallGraphDB(db_path=str(db_path), use_embeddings=use_embeddings)
+        self.db = StorageWriter(db_path=str(db_path), use_embeddings=use_embeddings)
 
-        # 3. Delete local entries (TODO: need to implement this in CallGraphDB)
+        # 3. Delete local entries (TODO: need to implement this in StorageWriter)
         print("\nWarning: Selective deletion not yet implemented")
         print("For now, use full extraction with --reset")
 
@@ -396,9 +407,9 @@ class ExtractionManager:
         # Extract Java
         print("\n=== Processing Java files ===")
         try:
-            java_extractor = JavaCallGraphExtractor(repos=repos_to_extract)
+            java_extractor = JavaASTExtractor(repos=repos_to_extract)
 
-            for source_type, entry in java_extractor.extract_all():
+            for source_type, entry in java_extractor.extract_all(limit=limit):
                 java_batch.append(entry)
 
                 if len(java_batch) >= batch_size:
@@ -413,7 +424,7 @@ class ExtractionManager:
         print("\n=== Processing XML files ===")
         xml_extractor = AxelorXmlExtractor(repos=repos_to_extract)
 
-        for source_type, entry in xml_extractor.extract_all():
+        for source_type, entry in xml_extractor.extract_all(limit=limit):
             xml_batch.append(entry)
 
             if len(xml_batch) >= batch_size:
@@ -440,19 +451,23 @@ def main():
                        help="Full extraction (Axelor repos + local)")
     parser.add_argument("--local", action="store_true",
                        help="Local extraction only")
-    parser.add_argument("--no-reset", action="store_true",
-                       help="Don't reset database before full extraction")
+    parser.add_argument("--reset", type=str, choices=["true", "false"], default="true",
+                       help="Reset database before full extraction (default: true)")
     parser.add_argument("--with-embeddings", action="store_true",
                        help="Enable semantic embeddings (slower, enables semantic search)")
+    parser.add_argument("--limit", type=int, default=None,
+                       help="Limit number of entries to extract per repo (for testing)")
 
     args = parser.parse_args()
 
     manager = ExtractionManager(Path(args.project_root))
 
+    reset = args.reset.lower() == "true"
+
     if args.full:
-        manager.extract_full(reset=not args.no_reset, use_embeddings=args.with_embeddings)
+        manager.extract_full(reset=reset, use_embeddings=args.with_embeddings, limit=args.limit)
     elif args.local:
-        manager.extract_local(use_embeddings=args.with_embeddings)
+        manager.extract_local(use_embeddings=args.with_embeddings, limit=args.limit)
     else:
         print("Please specify --full or --local")
         sys.exit(1)

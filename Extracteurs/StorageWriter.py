@@ -16,13 +16,13 @@ import hashlib
 
 # Import our extractors
 sys.path.insert(0, str(Path(__file__).parent))
-from extract_java_graph import JavaCallGraphExtractor
-from extract_xml_graph import AxelorXmlExtractor
-from extract_typescript_graph import TypeScriptGraphExtractor
+from JavaASTExtractor import JavaASTExtractor
+from AxelorXmlExtractor import AxelorXmlExtractor
+from TypeScriptASTExtractor import TypeScriptASTExtractor
 
 
-class CallGraphDB:
-    """Manages call graph storage in ChromaDB"""
+class StorageWriter:
+    """Manages call graph storage in ChromaDB (Write operations)"""
 
     # Embedding configuration constants
     EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
@@ -315,41 +315,36 @@ class CallGraphDB:
 
 
 def main():
-    """Build call graph database from project sources"""
-    print("[DEBUG] main() started")
+    """Build call graph database from project sources
+
+    NOTE: This is a legacy script. Use extraction_manager.py instead for better features:
+    - Axelor dependency detection and downloading
+    - Cache management for platform/suite
+    - Better progress tracking
+    - More robust error handling
+    """
     import argparse
 
-    print("[DEBUG] Creating argument parser...")
-    parser = argparse.ArgumentParser(description="Build call graph database from Java, XML, and TypeScript")
+    parser = argparse.ArgumentParser(
+        description="Build call graph database from Java and XML (LEGACY - use extraction_manager.py instead)"
+    )
     parser.add_argument("--reset", action="store_true",
                        help="Reset the database before building")
-    parser.add_argument("--test", action="store_true",
-                       help="Process only first 10 files of each type (for testing)")
     parser.add_argument("--stats", action="store_true",
                        help="Show database statistics")
     parser.add_argument("--find", type=str,
                        help="Find callers of a method/class")
-    parser.add_argument("--java-only", action="store_true",
-                       help="Process only Java files")
-    parser.add_argument("--xml-only", action="store_true",
-                       help="Process only XML files")
-    parser.add_argument("--ts-only", action="store_true",
-                       help="Process only TypeScript files")
     parser.add_argument("--with-embeddings", action="store_true",
                        help="Enable embedding generation (slower, enables semantic search)")
     parser.add_argument("--health", action="store_true",
-                       help="Show embedding health status (progress of scan/embedding generation)")
+                       help="Show embedding health status")
     parser.add_argument("--limit", type=int, default=None,
                        help="Limit on number of entries to extract (for testing)")
 
-    print("[DEBUG] Parsing arguments...")
     args = parser.parse_args()
-    print(f"[DEBUG] Arguments parsed: reset={args.reset}, limit={args.limit}")
 
     # Initialize database (no embeddings by default for speed)
-    print("[DEBUG] Initializing database...")
     db = CallGraphDB(use_embeddings=args.with_embeddings)
-    print("[DEBUG] Database initialized")
 
     # Show health if requested
     if args.health:
@@ -447,7 +442,7 @@ def main():
 
     # Simple generator-based processing
     stats = {'java': 0, 'xml': 0}
-    batch_size = 500  # Store in batches of 500
+    batch_size = 500
 
     java_batch = []
     xml_batch = []
@@ -456,68 +451,55 @@ def main():
         """Store accumulated batches"""
         nonlocal java_batch, xml_batch
         if java_batch:
-            print(f"  Storing {len(java_batch)} Java entries...")
             db.add_usages(java_batch)
             stats['java'] += len(java_batch)
             java_batch = []
         if xml_batch:
-            print(f"  Storing {len(xml_batch)} XML entries...")
             db.add_xml_references(xml_batch)
             stats['xml'] += len(xml_batch)
             xml_batch = []
 
     # Process Java files
-    if not args.xml_only and not args.ts_only:
-        print("\n=== Processing Java files ===")
-        try:
-            java_extractor = JavaCallGraphExtractor()
+    print("\n=== Processing Java files ===")
+    try:
+        java_extractor = JavaCallGraphExtractor(repos=["."])
 
-            for source_type, entry in java_extractor.extract_all(limit=args.limit):
-                java_batch.append(entry)
-
-                if len(java_batch) >= batch_size:
-                    flush_batches()
-
-        except RuntimeError as e:
-            print(f"Error: {e}")
-            if not args.xml_only:
-                sys.exit(1)
-        finally:
-            flush_batches()  # Flush remaining
-
-    # Process XML files
-    if not args.java_only and not args.ts_only:
-        print("\n=== Processing XML files ===")
-        xml_extractor = AxelorXmlExtractor()
-
-        for source_type, entry in xml_extractor.extract_all(limit=args.limit):
-            xml_batch.append(entry)
-
-            if len(xml_batch) >= batch_size:
+        for source_type, entry in java_extractor.extract_all(limit=args.limit):
+            java_batch.append(entry)
+            if len(java_batch) >= batch_size:
                 flush_batches()
 
-        flush_batches()  # Flush remaining
+    except RuntimeError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    finally:
+        flush_batches()
 
-    print(f"\nCompleted:")
-    if stats['java'] > 0:
-        print(f"  Java: {stats['java']} usages processed")
-    if stats['xml'] > 0:
-        print(f"  XML: {stats['xml']} references processed")
+    # Process XML files
+    print("\n=== Processing XML files ===")
+    xml_extractor = AxelorXmlExtractor(repos=["."])
+
+    for source_type, entry in xml_extractor.extract_all(limit=args.limit):
+        xml_batch.append(entry)
+        if len(xml_batch) >= batch_size:
+            flush_batches()
+
+    flush_batches()
 
     # Show final stats
-    stats = db.get_stats()
+    final_stats = db.get_stats()
     print("\n" + "="*60)
     print("Database updated:")
-    print(f"  Total entries: {stats['total_usages']}")
+    print(f"  Total entries: {final_stats['total_usages']}")
     print(f"\n  By source:")
-    for source, count in sorted(stats['sources'].items()):
+    for source, count in sorted(final_stats['sources'].items()):
         print(f"    {source}: {count}")
     print(f"\n  By type:")
-    for usage_type, count in sorted(stats['usage_types'].items()):
+    for usage_type, count in sorted(final_stats['usage_types'].items()):
         print(f"    {usage_type}: {count}")
-    if stats['modules']:
+    if final_stats['modules']:
         print(f"\n  By module (top 10):")
-        for module, count in sorted(stats['modules'].items(), key=lambda x: x[1], reverse=True)[:10]:
+        for module, count in sorted(final_stats['modules'].items(), key=lambda x: x[1], reverse=True)[:10]:
             print(f"    {module}: {count}")
 
 

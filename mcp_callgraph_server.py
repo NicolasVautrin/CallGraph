@@ -16,8 +16,8 @@ sys.path.insert(0, str(extracteurs_dir))
 
 from mcp.server import Server
 from mcp.types import Tool, TextContent
-from call_graph_service import CallGraphService
-from extraction_manager import ExtractionManager
+from StorageReader import StorageReader
+from ExtractionManager import ExtractionManager
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -27,7 +27,7 @@ logger = logging.getLogger("callgraph-mcp")
 app = Server("callgraph")
 
 # Global service instance
-service: CallGraphService = None
+service: StorageReader = None
 
 
 def init_service():
@@ -53,7 +53,7 @@ def init_service():
                 db_path = raw_db
                 logger.info("No database found, will use raw DB when created")
 
-            service = CallGraphService(str(db_path))
+            service = StorageReader(str(db_path))
             logger.info(f"Call graph service initialized with db: {db_path}")
         except Exception as e:
             logger.error(f"Failed to initialize service: {e}")
@@ -293,6 +293,7 @@ async def list_tools() -> list[Tool]:
 @app.call_tool()
 async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
     """Handle tool calls"""
+    global service
     init_service()
 
     try:
@@ -387,7 +388,6 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 extraction_log = output.getvalue()
 
                 # Re-initialize service after extraction
-                global service
                 service = None
                 init_service()
 
