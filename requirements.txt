@@ -1,0 +1,13 @@
+# CallGraph MCP Server - Python Dependencies
+
+# MCP SDK for Claude Desktop integration
+mcp>=0.9.0
+
+# Vector database for call graph storage
+chromadb>=0.4.0
+
+# Optional: For embeddings (semantic search)
+# sentence-transformers>=2.2.0
+
+# Utilities
+pathlib2>=2.3.7; python_version < '3.4'
