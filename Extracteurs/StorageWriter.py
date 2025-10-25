@@ -6,7 +6,7 @@ Processes all Java and XML files and stores usage information
 
 import sys
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 from datetime import datetime
 import chromadb
 from chromadb.config import Settings
@@ -79,8 +79,6 @@ class StorageWriter:
         if not entries:
             return
 
-        print(f"  Preparing {len(entries)} {source_type} entries for storage...")
-
         ids = []
         documents = []
         metadatas = []
@@ -121,7 +119,6 @@ class StorageWriter:
             minimal_embeddings = [[0.0] for _ in range(len(ids))]
 
         for batch_num, i in enumerate(range(0, len(ids), batch_size), 1):
-            print(f"  Storing batch {batch_num}/{total_batches}...", end='\r', flush=True)
 
             if self.use_embeddings:
                 self.collection.add(
@@ -136,8 +133,6 @@ class StorageWriter:
                     metadatas=metadatas[i:i+batch_size],
                     embeddings=minimal_embeddings[i:i+batch_size]
                 )
-
-        print(f"  Stored {len(ids)} {source_type} entries successfully.       ", flush=True)
 
     def add_usages(self, usages: List[dict]):
         """Add Java usages (delegates to add_entries)"""
@@ -312,6 +307,124 @@ class StorageWriter:
             name="call_graph",
             metadata={"description": "Java call graph for impact analysis"}
         )
+
+    def copy_from_cache(self, cache_db_path: str, batch_size: int = 500, limit: Optional[int] = None):
+        """Copy entries from a cache database into this database
+
+        This is much faster than re-extracting from source files.
+        Used to merge Axelor cache databases into the project database.
+
+        Args:
+            cache_db_path: Path to the cache database to copy from
+            batch_size: Number of entries to copy per batch (default: 500)
+            limit: Optional maximum number of entries to copy (None = all)
+
+        Returns:
+            Number of entries copied
+        """
+        print(f"    Copying from cache: {cache_db_path}")
+
+        # Open cache database (read-only)
+        cache_client = chromadb.PersistentClient(
+            path=str(cache_db_path),
+            settings=Settings(anonymized_telemetry=False)
+        )
+
+        try:
+            cache_collection = cache_client.get_collection("call_graph")
+        except Exception as e:
+            print(f"    ERROR: Could not open cache collection: {e}")
+            return 0
+
+        # Get total count
+        total_count = cache_collection.count()
+
+        # Apply limit if specified
+        max_to_copy = min(total_count, limit) if limit is not None else total_count
+
+        print(f"    Found {total_count} entries in cache")
+        if limit is not None:
+            print(f"    Limiting to {max_to_copy} entries")
+
+        if max_to_copy == 0:
+            return 0
+
+        # Copy in batches to avoid memory issues
+        copied = 0
+        offset = 0
+
+        while offset < max_to_copy and copied < max_to_copy:
+            # Calculate how many to fetch in this batch (respecting limit)
+            entries_remaining = max_to_copy - copied
+            current_batch_size = min(batch_size, entries_remaining)
+
+            # Fetch batch from cache (including embeddings if they exist)
+            batch = cache_collection.get(
+                limit=current_batch_size,
+                offset=offset,
+                include=['documents', 'metadatas', 'embeddings']
+            )
+
+            batch_size_actual = len(batch['ids'])
+            if batch_size_actual == 0:
+                break
+
+            # Log first embedding info for debugging (only first batch)
+            if copied == 0:
+                embeddings = batch.get('embeddings')
+                if embeddings is not None:
+                    first_emb = embeddings[0] if len(embeddings) > 0 else None
+                    if first_emb is not None:
+                        emb_type = type(first_emb).__name__
+                        emb_len = len(first_emb) if hasattr(first_emb, '__len__') else 'N/A'
+                        emb_preview = str(first_emb[:5]) if hasattr(first_emb, '__getitem__') else str(first_emb)
+                        print(f"    [DEBUG] First embedding: type={emb_type}, len={emb_len}, preview={emb_preview}...")
+                    else:
+                        print(f"    [DEBUG] First embedding is None")
+                else:
+                    print(f"    [DEBUG] No embeddings in batch")
+
+            # Prepare arguments for add()
+            add_args = {
+                'ids': batch['ids'],
+                'documents': batch['documents'],
+                'metadatas': batch['metadatas']
+            }
+
+            # Only include embeddings if they exist and are not all None
+            # ChromaDB returns None or a list of None when no embeddings exist
+            embeddings = batch.get('embeddings')
+            has_embeddings = False
+            if embeddings is not None:
+                # Check if any embedding is not None (handles both list and numpy arrays)
+                try:
+                    has_embeddings = any(emb is not None for emb in embeddings)
+                except (TypeError, ValueError):
+                    # If iteration fails or ambiguous truth value, assume we have embeddings
+                    has_embeddings = True
+
+            if has_embeddings:
+                add_args['embeddings'] = embeddings
+                if copied == 0:
+                    print(f"    [DEBUG] Including embeddings in add() - count: {len(embeddings)}")
+            else:
+                if copied == 0:
+                    print(f"    [DEBUG] No valid embeddings found, ChromaDB will handle based on collection config")
+            # Otherwise, let ChromaDB auto-generate or use minimal vectors based on collection config
+
+            # Add to target database
+            self.collection.add(**add_args)
+
+            copied += batch_size_actual
+            offset += batch_size_actual
+
+            # Progress indicator
+            if copied % 5000 == 0:
+                progress = f"{copied}/{max_to_copy}" if limit else f"{copied}/{total_count}"
+                print(f"    Copied {progress} entries...")
+
+        print(f"    OK - Copied {copied} entries from cache")
+        return copied
 
 
 def main():

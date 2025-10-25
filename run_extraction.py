@@ -9,6 +9,10 @@ import os
 from pathlib import Path
 import subprocess
 
+# Force unbuffered output for real-time logging
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 
 def main():
     import argparse
@@ -50,10 +54,12 @@ def main():
     # Build command
     cmd = [
         sys.executable,  # Use same Python interpreter
+        "-u",  # Force unbuffered output for subprocess
         str(extracteurs_dir / "ExtractionManager.py"),
         "--project-root", str(repo_path),
         f"--{args.mode}",
-        "--reset", "true" if reset else "false"
+        "--reset", "true" if reset else "false",
+        "--debug", "true"  # Always enable debug mode
     ]
 
     if args.limit:

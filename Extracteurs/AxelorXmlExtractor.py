@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import List, Dict, Optional, Set, Iterator, Tuple
 from dataclasses import dataclass
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue
 
 # Import XSD parser for schema-driven extraction
 try:
@@ -34,6 +36,9 @@ class XmlReference:
 class AxelorXmlExtractor:
     """Extracts references from Axelor XML files"""
 
+    # Parallelization configuration
+    FILE_WORKERS = 2  # Number of parallel file extraction threads (lower than Java due to high entries/file ratio)
+
     # Default fallback lists (if XSD parsing fails)
     DEFAULT_EVENT_ATTRIBUTES = [
         'onClick', 'onChange', 'onNew', 'onLoad', 'onSave',
@@ -48,12 +53,10 @@ class AxelorXmlExtractor:
 
     DEFAULT_EXPRESSION_ATTRIBUTES = ['expr', 'domain', 'target', 'value']
 
-    def __init__(self, xsd_path: Optional[Path] = None, view_cache_path: Optional[Path] = None,
-                 repos: Optional[List[str]] = None, config_path: str = None):
+    def __init__(self, repos: List[str], xsd_path: Optional[Path] = None, view_cache_path: Optional[Path] = None):
         self.current_file: Optional[Path] = None
         self.current_module: str = "unknown"
-        self.repos = repos  # Can be None
-        self.config_path = config_path or str(Path(__file__).parent / "repos_config.json")
+        self.repos = repos  # Required parameter
 
         # Try to load attributes from XSD schema
         self.EVENT_ATTRIBUTES = self._load_event_attributes(xsd_path)
@@ -123,102 +126,193 @@ class AxelorXmlExtractor:
             print(f"Warning: Could not load view cache ({e})")
             return {}
 
-    def discover_xml_files(self) -> List[Path]:
-        """Discover all XML files from configured repositories
+    def discover_xml_files(self, repo: str) -> List[Path]:
+        """Discover XML files from a single repository
+
+        Args:
+            repo: Repository path to scan
 
         Returns:
-            List of XML file paths found in all configured repositories
+            List of XML file paths found in the repository
         """
-        # Use repos from constructor if provided, otherwise read from config file
-        if self.repos is not None:
-            repos = self.repos
-        else:
-            config_file = Path(self.config_path)
-
-            if not config_file.exists():
-                print(f"Warning: Config file not found: {config_file}")
-                print("Using default: ['modules']")
-                repos = ["modules"]
-            else:
-                try:
-                    with open(config_file, 'r', encoding='utf-8') as f:
-                        config = json.load(f)
-                    repos = config.get("repositories", ["modules"])
-                except Exception as e:
-                    print(f"Error loading config: {e}")
-                    print("Using default: ['modules']")
-                    repos = ["modules"]
-
         # Exclusions
         exclude_dirs = {'build', 'node_modules', 'dist', '.git', 'target', 'bin', '.gradle', '.settings', 'out'}
 
-        xml_files = []
+        repo_path = Path(repo)
+        if not repo_path.exists():
+            print(f"  [SKIP] Not found: {repo}")
+            return []
 
-        for repo in repos:
-            repo_path = Path(repo)
-            if not repo_path.exists():
-                print(f"  [SKIP] Not found: {repo}")
-                continue
+        print(f"  [OK] Scanning: {repo}")
 
-            print(f"  [OK] Scanning: {repo}")
+        # Discover XML files recursively
+        xml_files = [
+            f for f in repo_path.rglob("*.xml")
+            if not any(d in f.parts for d in exclude_dirs)
+        ]
 
-            # Discover XML files recursively
-            repo_xml_files = [
-                f for f in repo_path.rglob("*.xml")
-                if not any(d in f.parts for d in exclude_dirs)
-            ]
-
-            xml_files.extend(repo_xml_files)
-            print(f"    Found {len(repo_xml_files)} XML files")
-
-        print(f"\nTotal: {len(xml_files)} XML files discovered")
+        print(f"    Found {len(xml_files)} XML files")
         return xml_files
 
-    def extract_all(self, limit: Optional[int] = None) -> Iterator[Tuple[str, Dict]]:
-        """Generator that yields XML entries as they are extracted
+    def _extract_file_task(self, xml_file: Path, queue: Queue):
+        """Extract entries from a single XML file and push to queue (used for parallel processing)
 
         Args:
-            limit: Optional limit on number of ENTRIES to extract (None = all)
+            xml_file: Path to XML file
+            queue: Thread-safe queue to push entries to
+        """
+        try:
+            file_entries = self.extract_from_file(xml_file)
+            for entry in file_entries:
+                queue.put(('xml', entry))
+        except Exception as e:
+            print(f"  Error extracting {xml_file.name}: {e}")
+
+    def extract_all(self, limit: Optional[int] = None) -> Iterator[Tuple[str, Dict]]:
+        """Generator that yields XML entries as they are extracted (files processed in parallel)
+
+        Args:
+            limit: Optional limit on number of ENTRIES to extract per repo (None = all)
 
         Yields:
             Tuples of ('xml', entry_dict) where entry_dict contains 'document' and 'metadata'
         """
-        print("[XML] Discovering XML files...", flush=True)
-        xml_files = self.discover_xml_files()
+        repos = self.repos
 
-        if not xml_files:
-            print("No XML files to process", flush=True)
+        if not repos:
+            print("[XML] Warning: No repositories provided, nothing to extract")
             return
 
-        total_files = len(xml_files)
-        total_entries = 0
-        print(f"[XML] Processing {total_files} XML files", flush=True)
+        print(f"[XML] Discovering XML files from {len(repos)} repositories...")
 
-        for file_num, xml_file in enumerate(xml_files, 1):
-            # Check limit on entries
-            if limit is not None and total_entries >= limit:
-                print(f"\n[XML] Reached limit of {limit} entries")
-                break
+        # Step 1: Discover all XML files from all repos, organized by repo
+        files_by_repo = {}
+        all_files = []
+        for repo in repos:
+            print(f"\n[REPO] Scanning: {repo}")
+            xml_files = self.discover_xml_files(repo)
+            repo_normalized = str(Path(repo).resolve()).replace('\\', '/')
+            files_by_repo[repo_normalized] = xml_files
+            all_files.extend(xml_files)
 
-            # Progress indicator
-            progress_pct = int((file_num / total_files) * 100)
-            print(f"[XML] Processing {file_num}/{total_files} ({progress_pct}%) - {xml_file.name}")
+        total_files = len(all_files)
+        print(f"\n[XML] Found {total_files} XML files total")
+        print(f"[XML] Extracting files in parallel (max_workers={self.FILE_WORKERS})...")
 
-            try:
-                entries = self.extract_from_file(xml_file)
-                print(f"  Extracted {len(entries)} entries")
+        # Step 2: Extract files in parallel using a queue with per-repo limits
+        entry_queue = Queue()
+        total_yielded = 0
+        processed_files = 0
+        import time
+        start_time = time.time()
 
-                for entry in entries:
-                    if limit is None or total_entries < limit:
-                        yield ('xml', entry)
-                        total_entries += 1
-                    else:
+        # Track entries yielded per repo
+        repo_counters = {repo: 0 for repo in files_by_repo.keys()}
+
+        # Track file indices per repo
+        repo_file_indices = {repo: 0 for repo in files_by_repo.keys()}
+
+        with ThreadPoolExecutor(max_workers=self.FILE_WORKERS) as executor:
+            # Submit initial batch of files (only FILE_WORKERS, not 2x, to avoid queue explosion)
+            # XML files can produce many entries each, so we start conservatively
+            # Workers can consume any file, we just need to track which repo each file belongs to
+            futures = []
+            submitted_count = 0
+            initial_batch_size = min(self.FILE_WORKERS, total_files)
+
+            # Submit first N files across all repos
+            for repo, files in files_by_repo.items():
+                for i in range(len(files)):
+                    if submitted_count >= initial_batch_size:
                         break
+                    future = executor.submit(self._extract_file_task, files[i], entry_queue)
+                    futures.append(future)
+                    repo_file_indices[repo] += 1
+                    submitted_count += 1
+                if submitted_count >= initial_batch_size:
+                    break
 
-            except Exception as e:
-                print(f"  Error: {e}")
+            # Process results and submit new files dynamically
+            while futures or not entry_queue.empty():
+                # Check completed futures and submit new files from repos not at limit
+                for future in futures[:]:
+                    if future.done():
+                        futures.remove(future)
+                        processed_files += 1
 
-        print(f"\n[XML] Total: {total_entries} entries")
+                        # Progress indicator every 50 files
+                        if processed_files % 50 == 0:
+                            progress_pct = int((processed_files / total_files) * 100)
+                            elapsed = time.time() - start_time
+                            elapsed_minutes = int(elapsed / 60)
+                            elapsed_seconds = int(elapsed % 60)
+                            if processed_files > 0:
+                                avg_time_per_file = elapsed / processed_files
+                                remaining_files = total_files - processed_files
+                                eta_seconds = avg_time_per_file * remaining_files
+                                eta_minutes = int(eta_seconds / 60)
+                                eta_seconds_rem = int(eta_seconds % 60)
+                                print(f"[XML] Processed {processed_files}/{total_files} files ({progress_pct}%) - Elapsed: {elapsed_minutes}m {elapsed_seconds}s - ETA: {eta_minutes}m {eta_seconds_rem}s")
+
+                        try:
+                            future.result()  # Check for exceptions
+                        except Exception as e:
+                            print(f"  [ERROR] File extraction failed: {e}")
+
+                        # Submit next file from any repo that hasn't reached its limit
+                        for repo in files_by_repo.keys():
+                            if limit is None or repo_counters[repo] < limit:
+                                idx = repo_file_indices[repo]
+                                files = files_by_repo[repo]
+                                if idx < len(files):
+                                    next_future = executor.submit(self._extract_file_task, files[idx], entry_queue)
+                                    futures.append(next_future)
+                                    repo_file_indices[repo] += 1
+                                    submitted_count += 1
+                                    break  # Submit only 1 file per completed file
+
+                # Try to get entries from queue (non-blocking)
+                try:
+                    entry = entry_queue.get(timeout=0.1)
+
+                    # Find which repo this entry belongs to
+                    source_file = entry[1]['metadata'].get('source_file', '')
+                    source_file_normalized = str(Path(source_file).resolve()).replace('\\', '/')
+
+                    entry_repo = None
+                    for repo in files_by_repo.keys():
+                        if source_file_normalized.startswith(repo):
+                            entry_repo = repo
+                            break
+
+                    # Check per-repo limit BEFORE yielding
+                    if entry_repo and (limit is None or repo_counters[entry_repo] < limit):
+                        yield entry
+                        total_yielded += 1
+                        repo_counters[entry_repo] += 1
+
+                        # Log every 500 entries
+                        if total_yielded % 500 == 0:
+                            remaining = total_files - submitted_count
+                            print(f"[XML] Yielded {total_yielded} entries (queue size: {entry_queue.qsize()}, {remaining} files remaining)")
+
+                    # Check if all repos reached their limit
+                    if limit is not None:
+                        all_repos_done = all(
+                            repo_counters[repo] >= limit or repo_file_indices[repo] >= len(files_by_repo[repo])
+                            for repo in files_by_repo.keys()
+                        )
+                        if all_repos_done and entry_queue.empty():
+                            print(f"\n[XML] All repos reached limit of {limit} entries, stopping...")
+                            for f in futures:
+                                f.cancel()
+                            return
+
+                except:
+                    # Queue is empty, continue
+                    pass
+
+        print(f"\n[XML] Total: {total_yielded} entries from {processed_files} files")
 
     def _extract_module_from_path(self, file_path: Path) -> str:
         """Extract module name from file path"""
@@ -308,6 +402,7 @@ class AxelorXmlExtractor:
             # Build metadata (context as JSON string since ChromaDB only accepts primitives)
             metadata = {
                 "source": "xml",
+                "source_file": ref.file_path,  # Add source_file for routing
                 "usageType": ref.ref_type,
                 "callerUri": ref.file_path,
                 "callerLine": ref.line_number,

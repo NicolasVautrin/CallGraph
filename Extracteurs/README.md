@@ -1,6 +1,6 @@
-# Extracteurs - Architecture du système d'extraction
+# Extracteurs - Architecture du système d'extraction du Call Graph
 
-Système d'extraction du call graph Java/XML pour projets Axelor avec cache intelligent.
+Système d'extraction du call graph Java/XML pour projets Axelor avec cache intelligent et stockage dans ChromaDB.
 
 ## Vue d'ensemble
 
@@ -13,53 +13,48 @@ Et stocke les résultats dans une **base vectorielle ChromaDB** pour requêtes r
 ## Architecture globale
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     MCP CallGraph Server                        │
-│  (mcp_callgraph_server.py)                                      │
-│  - API MCP pour interroger le call graph                        │
-│  - Auto-détecte .vector-raw-db ou .vector-semantic-db           │
-└────────────────────────┬────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                   MCP CallGraph Server                      │
+│  (mcp_callgraph_server.py)                                  │
+│  - API MCP pour interroger le call graph                    │
+│  - Auto-détecte .vector-raw-db ou .vector-semantic-db       │
+└────────────────────────┬────────────────────────────────────┘
                          │
                          ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                 Extraction Manager                              │
-│  (extraction_manager.py)                                        │
-│  - Orchestration des extractions                                │
-│  - Gestion du cache Axelor                                      │
-│  - Fusion des bases de données                                  │
-└──────┬──────────────────────────────┬───────────────────────────┘
-       │                              │
-       ▼                              ▼
-┌──────────────────┐          ┌──────────────────────┐
-│ Axelor Repo Mgr  │          │  CallGraph DB        │
-│ (fetch_axelor_   │          │  (build_call_graph_  │
-│  repos.py)       │          │   db.py)             │
-│ - Détecte        │          │ - Interface ChromaDB │
-│   versions       │          │ - Indexation usages  │
-│ - Download repos │          │ - Requêtes           │
-│ - Gère caches DB │          └──────────────────────┘
-└────────┬─────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                   ExtractionManager                         │
+│  - Orchestration de l'extraction complète                   │
+│  - Gestion du cache Axelor                                  │
+│  - Fusion des bases de données                              │
+└────────┬──────────────────────┬─────────────────────────────┘
+         │                      │
+         ▼                      ▼
+┌─────────────────┐      ┌─────────────────┐
+│ AxelorRepoMgr   │      │  StorageWriter  │
+│ - Détection     │      │  - ChromaDB     │
+│   versions      │      │  - Indexation   │
+│ - Download      │      │  - Requêtes     │
+│ - Cache DB      │      └─────────────────┘
+└────────┬────────┘
          │
          ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                         Extracteurs                             │
-├──────────────────────────────┬──────────────────────────────────┤
-│  Java Extractor              │  XML Extractor                   │
-│  (extract_java_graph.py)     │  (extract_xml_graph.py)          │
-│  - Découvre fichiers .java   │  - Découvre fichiers .xml        │
-│  - Envoie à JavaASTService   │  - Parse XML Axelor              │
-│  - Filtre résultats          │  - Extrait actions/views/menus   │
-│  - Générateur Python         │  - Générateur Python             │
-└────────┬─────────────────────┴──────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                       Extracteurs                           │
+├────────────────────┬────────────────────┬───────────────────┤
+│  JavaASTExtractor  │  AxelorXmlExtractor│  TypeScriptAST..  │
+│  - Scan *.java     │  - Scan *.xml      │  - Scan *.ts/js   │
+│  - Via service     │  - Parse direct    │  - AST analysis   │
+│  - Parallélisé     │  - Parallélisé     │  - À venir        │
+└────────┬───────────┴────────────────────┴───────────────────┘
          │
          ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   JavaASTService (Java)                         │
-│  - Service HTTP REST (port 8765)                                │
-│  - JavaParser + JavaSymbolSolver                                │
-│  - Cache de parsers par ensemble de repos                       │
-│  - Résolution FQN et emplacements                               │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│               JavaASTService (Java)                         │
+│  - Service HTTP REST (port 8765)                            │
+│  - JavaParser + JavaSymbolSolver                            │
+│  - Cache de parsers par ensemble de repos                   │
+│  - Résolution FQN et emplacements                           │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ## Flux d'extraction
@@ -67,75 +62,53 @@ Et stocke les résultats dans une **base vectorielle ChromaDB** pour requêtes r
 ### Mode "full" : Extraction complète avec Axelor
 
 ```
-1. Détection versions
-   extraction_manager.py
-   └─> fetch_axelor_repos.py : detect_axelor_versions()
-       ├─> Lit gradle.properties
-       └─> Trouve platform=8.2.9, suite=8.2.9
+1. Détection des versions Axelor
+   ExtractionManager → AxelorRepoManager.detect_axelor_versions()
+   ├─> Lit gradle.properties et build.gradle
+   └─> Trouve platform=8.2.x, suite=8.2.x
 
-2. Download Axelor repos (si nécessaire)
-   fetch_axelor_repos.py : ensure_repos()
-   └─> git clone axelor-open-platform v8.2.9
-   └─> git clone axelor-open-suite v8.2.9
-       Destination: axelor-repos/axelor-open-platform-8.2.9/
-                   axelor-repos/axelor-open-suite-8.2.9/
+2. Download des repos Axelor (si nécessaire)
+   AxelorRepoManager.ensure_repos()
+   └─> git clone axelor-open-platform vX.X.X
+   └─> git clone axelor-open-suite vX.X.X
+       Destination: axelor-repos/axelor-open-platform-X.X.X/
+                    axelor-repos/axelor-open-suite-X.X.X/
 
 3. Vérification des caches
-   fetch_axelor_repos.py : has_cached_db()
-   ├─> Cherche axelor-open-platform-8.2.9/.vector-raw-db/
-   ├─> Cherche axelor-open-suite-8.2.9/.vector-raw-db/
+   AxelorRepoManager.has_cached_db()
+   ├─> Cherche axelor-open-platform-X.X.X/.vector-raw-db/
+   ├─> Cherche axelor-open-suite-X.X.X/.vector-raw-db/
    └─> Si manquant → extraction nécessaire
 
-4. Extraction des repos manquants (avec cache de parser)
-   Pour chaque repo Axelor manquant :
+4. Extraction des repos manquants
+   Pour chaque repo Axelor sans cache :
 
-   extraction_manager.py : _extract_repo_to_cache()
-   ├─> JavaCallGraphExtractor(repos=[platform, suite])
-   │   └─> extract_java_graph.py
-   │       └─> POST /analyze avec repos=[platform, suite]
-   │           └─> JavaASTService
-   │               ├─> [NEW] Creating parser for 2 repos (premier appel)
-   │               ├─> Scanne src/main/java de chaque repo
-   │               └─> Cache le parser avec clé {platform, suite}
+   ExtractionManager._extract_all_repos()
+   ├─> JavaASTExtractor(repos=[platform, suite, project])
+   │   └─> Extraction parallèle avec routing par source_file
+   │       ├─> Entries platform → cache platform
+   │       ├─> Entries suite → cache suite
+   │       └─> Entries project → DB projet
    │
-   ├─> Filtre les résultats par source_file
-   │   (garde seulement les fichiers du repo en cours)
-   │
-   └─> Sauvegarde dans cache
-       platform/.vector-raw-db/  (usages de platform uniquement)
-       suite/.vector-raw-db/     (usages de suite uniquement)
+   └─> AxelorXmlExtractor(repos=[platform, suite, project])
+       └─> Extraction parallèle avec routing par source_file
 
-5. Construction de la base projet
-   extraction_manager.py : extract_full()
+5. Fusion des caches dans la DB projet
+   ExtractionManager.copy_from_cache()
    ├─> Copie platform/.vector-raw-db/ → projet/.vector-raw-db/
-   ├─> Fusionne suite/.vector-raw-db/ (si multiple repos)
-   │   └─> Réutilise cache parser {platform, suite}
-   │
-   └─> Extraction modules locaux
-       ├─> JavaCallGraphExtractor(repos=[platform, suite, modules])
-       │   └─> POST /analyze avec repos=[platform, suite, modules]
-       │       └─> JavaASTService
-       │           └─> [NEW] Creating parser for 3 repos (nouveau set)
-       │
-       ├─> Filtre par modules/
-       └─> Ajoute à projet/.vector-raw-db/
+   ├─> Fusionne suite/.vector-raw-db/
+   └─> Les entries projet sont déjà dans la DB
 
-6. Résultat final
-   projet/.vector-raw-db/
-   ├─> Usages de platform (copiés du cache)
-   ├─> Usages de suite (copiés du cache)
-   └─> Usages de modules (extraits avec résolution complète)
+   → Résultat: DB complète avec tous les symboles résolus
 ```
 
 ### Mode "local" : Extraction modules uniquement
 
 ```
 1. Extraction locale
-   extraction_manager.py : extract_local()
-   └─> JavaCallGraphExtractor(repos=[modules])
-       └─> POST /analyze avec repos=[modules]
-           └─> JavaASTService
-               └─> [NEW] Creating parser for 1 repo
+   ExtractionManager.extract_local()
+   └─> JavaASTExtractor(repos=[modules])
+   └─> AxelorXmlExtractor(repos=[modules])
 
    Note: Résolution FQN limitée (seulement modules/)
 ```
@@ -147,10 +120,10 @@ Et stocke les résultats dans une **base vectorielle ChromaDB** pour requêtes r
 **Localisation** :
 ```
 axelor-repos/
-├─ axelor-open-platform-8.2.9/
+├─ axelor-open-platform-X.X.X/
 │  ├─ .vector-raw-db/         # Cache DB pour platform
 │  └─ .vector-semantic-db/    # Cache DB avec embeddings (optionnel)
-└─ axelor-open-suite-8.2.9/
+└─ axelor-open-suite-X.X.X/
    ├─ .vector-raw-db/         # Cache DB pour suite
    └─ .vector-semantic-db/    # Cache DB avec embeddings (optionnel)
 
@@ -162,7 +135,7 @@ projet/
 **Avantages** :
 - Extraction Axelor : une fois par version
 - Projets multiples : réutilisation des caches
-- Gain de temps : 90% sur re-extraction
+- Gain de temps : 70-90% sur re-extraction
 
 ### Cache de parsers (JavaASTService)
 
@@ -181,9 +154,9 @@ Map<Set<String>, JavaParser> parserCache = {
 - Résolution FQN optimale avec tous les repos
 - Cache automatique par combinaison de repos
 
-## Composants détaillés
+## Composants
 
-### 1. extraction_manager.py
+### 1. ExtractionManager.py
 
 **Rôle** : Orchestration de l'extraction complète
 
@@ -191,18 +164,23 @@ Map<Set<String>, JavaParser> parserCache = {
 - `ensure_axelor_repos()` : Download repos Axelor si nécessaire
 - `extract_full(reset, use_embeddings)` : Extraction complète avec cache
 - `extract_local(use_embeddings)` : Extraction locale uniquement
-- `_extract_repo_to_cache(repo, cache_db, all_repos)` : Extrait un repo dans son cache
-- `_extract_repo_into_db(repo, db, all_repos)` : Extrait un repo dans une DB existante
+- `_extract_all_repos(repos, all_repos, project_db)` : Extrait tous les repos avec routing intelligent
 
 **Flux extract_full()** :
 1. Détecte versions Axelor
 2. Download repos manquants
 3. Vérifie caches existants
-4. Extrait repos manquants → caches
+4. Extrait repos manquants → caches (en parallèle)
 5. Copie caches → projet DB
-6. Extrait local → projet DB
+6. Extrait local → projet DB (avec résolution complète)
 
-### 2. fetch_axelor_repos.py
+**Nouveautés v2.0** :
+- Extraction parallèle avec routing par `source_file`
+- Une seule passe d'extraction pour tous les repos
+- Fusion optimisée des caches
+- Support debug avec statistiques détaillées
+
+### 2. AxelorRepoManager.py
 
 **Rôle** : Gestion des dépendances Axelor
 
@@ -222,24 +200,22 @@ axelorSuiteVersion=8.2.9
 com.axelor:axelor-gradle:8.2.9
 ```
 
-**Download** :
-```bash
-git clone --branch v8.2.9 --depth 1 \
-  https://github.com/axelor/axelor-open-platform.git \
-  axelor-repos/axelor-open-platform-8.2.9
-```
-
-### 3. extract_java_graph.py
+### 3. JavaASTExtractor.py
 
 **Rôle** : Extraction usages Java via JavaASTService
 
-**Classe** : `JavaCallGraphExtractor`
+**Classe** : `JavaASTExtractor`
 
 **Méthodes** :
 - `__init__(repos)` : Initialise avec liste de repos
 - `discover_java_files()` : Trouve tous les .java (exclut build/, node_modules/)
 - `extract_all(limit)` : Générateur Python qui yield les usages
 - `extract_from_file(java_file)` : Extrait un fichier via API
+
+**Extraction parallèle** :
+- `FILE_WORKERS = 6` : 6 threads pour extraction des fichiers
+- Queue pour résultats en temps réel
+- Routing automatique par `source_file` vers DB cible
 
 **Requête API** :
 ```python
@@ -252,57 +228,121 @@ POST http://localhost:8765/analyze
 
 **Auto-start** : Lance JavaASTService si non démarré
 
-### 4. extract_xml_graph.py
+### 4. AxelorXmlExtractor.py
 
 **Rôle** : Extraction références XML Axelor
 
 **Classe** : `AxelorXmlExtractor`
 
 **Extrait** :
-- Actions (action-method, action-view, etc.)
-- Vues (form, grid, etc.)
-- Menus
-- Appels de méthodes depuis XML
+- Définitions et extensions de vues (form, grid, etc.)
+- Actions (action-method, action-view, action-group)
+- Triggers d'événements (onClick, onChange, etc.)
+- Références de champs avec résolution de modèle
+- Expressions et scripts Groovy
+- Références de vues (form-view, grid-view, etc.)
+- Inline action-groups (onClick="action1,action2")
 
-**Générateur** : Même pattern que JavaCallGraphExtractor
+**Extraction parallèle** :
+- `FILE_WORKERS = 2` : 2 threads (XML files ont beaucoup d'entries)
+- Queue pour résultats en temps réel
+- Routing automatique par `source_file`
 
-### 5. build_call_graph_db.py
+**Résolution de modèle** :
+```python
+# Hiérarchie de résolution pour les champs
+1. field's target attribute
+2. parent panel-related's target attribute
+3. parent panel-related's grid-view/form-view (via cache)
+4. parent editor's parent field target
+5. parent view's model attribute (form, grid, etc.)
+```
 
-**Rôle** : Interface ChromaDB
+**Cache view-to-model** :
+- Chargement optionnel d'un cache global `.view-model-cache.json`
+- Résolution cross-module des champs dans panel-related
 
-**Classe** : `CallGraphDB`
+### 5. StorageWriter.py
+
+**Rôle** : Interface ChromaDB pour écriture
+
+**Classe** : `StorageWriter`
 
 **Méthodes** :
 - `add_usages(entries)` : Ajoute usages Java (batch)
 - `add_xml_references(entries)` : Ajoute références XML (batch)
-- `query_usages(symbol, filters)` : Requête par symbole
+- `add_ts_usages(entries)` : Ajoute usages TypeScript (batch)
+- `copy_from_cache(cache_path, limit)` : Copie depuis un cache DB
 - `get_stats()` : Statistiques DB
 - `reset()` : Vide la collection
 
 **Modes** :
 - `use_embeddings=False` : DB rapide (métadonnées uniquement)
+  - Vecteurs minimaux [0.0] pour éviter le calcul d'embeddings
+  - Marquage: `embedding_model_name = "none"`
 - `use_embeddings=True` : DB sémantique (recherche par similarité)
+  - Utilise sentence-transformers (all-MiniLM-L6-v2)
+  - Calcul automatique des embeddings
 
-### 6. call_graph_service.py
+**Métadonnées de tracking** :
+```python
+{
+  "embedding_model_name": "all-MiniLM-L6-v2" ou "none",
+  "document_strategy_version": "1.0" ou "none",
+  "embedding_timestamp": "2025-01-15T10:30:00",
+  "scan_timestamp": "2025-01-15T10:30:00"
+}
+```
 
-**Rôle** : Requêtes avancées sur le call graph
+### 6. StorageReader.py
 
-**Méthodes** :
-- `find_usages(symbol, depth, filters)` : Trouve usages avec récursion
+**Rôle** : Interface ChromaDB pour lecture/requêtes
+
+**Classe** : `StorageReader`
+
+**Méthodes principales** :
+- `query_usages(symbol, filters)` : Requête par symbole
+- `search_by_file(file_path)` : Usages dans un fichier
 - `get_definition(symbol)` : Trouve définitions
 - `find_callers(symbol)` : Qui appelle ce symbole
 - `find_callees(symbol)` : Que appelle ce symbole
-- `impact_analysis(symbol, depth)` : Analyse d'impact récursive
-- `format_result(operation, data)` : Formatage pretty print
+
+### 7. JavaASTService (Java/Gradle)
+
+**Rôle** : Service HTTP REST pour analyse AST Java
+
+**Technologie** :
+- JavaParser + JavaSymbolSolver
+- Spring Boot / Javalin HTTP server
+- Port 8765
+
+**Endpoints** :
+- `GET /health` : Vérification état
+- `POST /analyze` : Analyse fichiers Java
+
+**Types d'usages extraits** :
+1. `java_method_call` : Appels de méthodes
+2. `java_constructor_call` : new Classe()
+3. `java_field_access` : Accès à des champs
+4. `java_extends` : Héritage de classes
+5. `java_implements` : Implémentation d'interfaces
+6. `java_method_definition` : Définitions de méthodes
+7. `java_class_definition` : Définitions de classes
+8. `java_field_definition` : Définitions de champs
+
+**Cache de parsers** :
+- Un parser par combinaison unique de repos
+- Clé de cache: Set<String> des chemins de repos
+- Résolution FQN optimale avec tous les repos
 
 ## Types de bases de données
 
 ### .vector-raw-db (par défaut)
 
 **Contenu** :
-- Documents : `"java_method_call: doSomething in myMethod() at com.example.Controller"`
+- Documents : `"usage_type: symbol in context"`
 - Métadonnées : Tous les champs (file, line, FQN, etc.)
-- Embeddings : **Désactivés**
+- Embeddings : **Désactivés** (vecteurs minimaux)
 
 **Performance** :
 - Insertion : ~2000 usages/sec
@@ -341,8 +381,16 @@ manager.extract_full(use_embeddings=True)
 
 ```bash
 cd Extracteurs
-python extraction_manager.py --project-root "/path/to/project" --full
+python ExtractionManager.py --project-root "/path/to/project" --full
 ```
+
+**Options** :
+- `--full` : Extraction complète (Axelor + local)
+- `--local` : Extraction locale uniquement
+- `--reset true|false` : Reset database (défaut: true)
+- `--with-embeddings` : Active les embeddings sémantiques
+- `--limit N` : Limite d'entries par repo (pour tests)
+- `--debug true|false` : Active statistiques détaillées
 
 **Résultat** :
 - Download Axelor repos (si manquant)
@@ -354,7 +402,7 @@ python extraction_manager.py --project-root "/path/to/project" --full
 ### Extraction locale
 
 ```bash
-python extraction_manager.py --project-root "/path/to/project" --local
+python ExtractionManager.py --project-root "/path/to/project" --local
 ```
 
 **Résultat** :
@@ -364,11 +412,24 @@ python extraction_manager.py --project-root "/path/to/project" --local
 ### Avec embeddings
 
 ```bash
-python extraction_manager.py --project-root "/path/to/project" --full --with-embeddings
+python ExtractionManager.py --project-root "/path/to/project" --full --with-embeddings
 ```
 
 **Résultat** :
 - DB finale : `projet/.vector-semantic-db/`
+- Temps d'extraction : ~10x plus long
+- Permet recherche sémantique
+
+### Mode debug
+
+```bash
+python ExtractionManager.py --project-root "/path/to/project" --full --debug true
+```
+
+**Résultat** :
+- Affiche statistiques détaillées par repo
+- Compare extracted vs stored entries
+- Montre les ratios d'expansion (bidirectional refs)
 
 ## Intégration MCP
 
@@ -383,7 +444,7 @@ python extraction_manager.py --project-root "/path/to/project" --full --with-emb
   "mcpServers": {
     "callgraph": {
       "command": "python",
-      "args": ["C:/Users/nicolasv/MCP_servers/CallGraph/mcp_callgraph_server.py"]
+      "args": ["C:/path/to/mcp_callgraph_server.py"]
     }
   }
 }
@@ -407,15 +468,16 @@ elif (cwd / ".vector-raw-db").exists():
 - `impact_analysis(symbol, depth)` : Impact récursif
 - `search_by_file(file_path)` : Usages dans un fichier
 - `get_stats(module)` : Statistiques
+- `extract(mode, reset)` : Lance extraction
 
 ## Performance
 
-### Extraction complète (projet Bricklead)
+### Extraction complète (projet type)
 
 **Configuration** :
-- Platform : 829 fichiers Java
-- Suite : 3,467 fichiers Java
-- Local : 2,729 fichiers Java
+- Platform : ~800 fichiers Java
+- Suite : ~3,500 fichiers Java
+- Local : ~2,700 fichiers Java
 - Total : ~7,000 fichiers
 
 **Temps (sans cache)** :
@@ -439,15 +501,15 @@ elif (cwd / ".vector-raw-db").exists():
 
 ### Taille des bases
 
-**Platform 8.2.9** :
+**Platform v8.2.x** :
 - .vector-raw-db : ~50 MB
 - Usages : ~90,000
 
-**Suite 8.2.9** :
+**Suite v8.2.x** :
 - .vector-raw-db : ~120 MB
 - Usages : ~210,000
 
-**Local (Bricklead)** :
+**Local (projet type)** :
 - .vector-raw-db : ~80 MB
 - Usages : ~160,000
 
@@ -466,24 +528,24 @@ Error: JavaASTService did not start within 30 seconds
 
 **Solutions** :
 1. Vérifier Java installé : `java -version` (besoin Java 11+)
-2. Builder le service : `cd JavaASTService && ./gradlew build`
-3. Démarrer manuellement : `./gradlew service`
+2. Builder le service : `cd JavaASTService && gradlew build`
+3. Démarrer manuellement : `gradlew service`
 
 ### Cache non détecté
 
 **Symptômes** :
 ```
-[CACHE] No cached DB for platform v8.2.9, will extract
+[CACHE] No cached DB for platform v8.2.x, will extract
 ```
 
 **Vérification** :
 ```bash
-ls axelor-repos/axelor-open-platform-8.2.9/.vector-raw-db/
+ls axelor-repos/axelor-open-platform-8.2.x/.vector-raw-db/
 # Doit contenir : chroma.sqlite3
 ```
 
 **Solution** :
-- Réextraire : `--full --reset`
+- Réextraire : `--full --reset true`
 
 ### Résolution FQN échoue
 
@@ -501,39 +563,180 @@ calleeFqn: "unknown"
 ### Extraction lente
 
 **Optimisations** :
-1. Utiliser `--no-embeddings` (10x plus rapide)
-2. Réutiliser les caches Axelor (pas de `--reset`)
+1. Utiliser mode rapide (pas d'embeddings - défaut)
+2. Réutiliser les caches Axelor (`--reset false`)
 3. Garder JavaASTService en mémoire (pas de redémarrage)
+
+### Erreurs de routing
+
+**Symptômes** :
+```
+[DEBUG] Entry X NOT MATCHED
+```
+
+**Causes** :
+- Chemins relatifs vs absolus
+- Séparateurs Windows vs Unix
+
+**Solution** :
+- Tous les chemins sont normalisés (.resolve() + replace('\\', '/'))
+- Si le problème persiste, activer `--debug true` pour voir les chemins
 
 ## Développement
 
-### Ajouter un nouveau type d'usage
+### Ajouter un nouveau type d'usage Java
 
 1. **JavaASTService** : Modifier `UsageCollector.java`
-2. **Extraction** : Aucune modification nécessaire (automatique)
+2. **Extraction** : Aucune modification (automatique)
 3. **DB** : Aucune modification (métadonnées flexibles)
 4. **MCP** : Aucune modification (requêtes génériques)
 
-### Ajouter un nouveau langage
+### Ajouter un nouveau type d'extracteur
 
-1. Créer `extract_XXX_graph.py` avec générateur
-2. Ajouter appel dans `extraction_manager.py`
-3. Suivre le pattern Java/XML
+1. Créer `XXXExtractor.py` avec générateur `extract_all()`
+2. Implémenter :
+   - `discover_files(repo)` : Liste les fichiers
+   - `extract_from_file(file, queue)` : Extrait un fichier
+   - `extract_all(limit)` : Générateur avec parallélisation
+3. Ajouter appel dans `ExtractionManager._extract_all_repos()`
+
+**Pattern à suivre** :
+```python
+class XXXExtractor:
+    FILE_WORKERS = 4  # Nombre de threads
+
+    def __init__(self, repos: List[str]):
+        self.repos = repos
+
+    def extract_all(self, limit: Optional[int] = None) -> Iterator[Tuple[str, Dict]]:
+        # Découverte fichiers
+        # Extraction parallèle
+        # Yield ('xxx', entry_dict)
+        pass
+```
 
 ### Tester l'extraction
 
 ```bash
 # Test sur un seul fichier
 cd Extracteurs
-python extract_java_graph.py path/to/File.java
+python JavaASTExtractor.py path/to/File.java
 
-# Test sur un module
-python extract_java_graph.py modules/open-auction-base/
+# Test sur un module avec limite
+python ExtractionManager.py --project-root . --full --limit 100
 
-# Stats
+# Stats DB
 python -c "
-from build_call_graph_db import CallGraphDB
-db = CallGraphDB('.vector-raw-db')
+from StorageWriter import StorageWriter
+db = StorageWriter('.vector-raw-db')
 print(db.get_stats())
 "
 ```
+
+## Architecture v2.0 - Changements majeurs
+
+### Avant (v1.0)
+
+```
+Pour chaque repo:
+  1. Extrait repo → DB temporaire
+  2. Copie DB temporaire → DB finale
+
+→ Problème: Extraction séquentielle, lente
+→ N extractions pour N repos
+```
+
+### Après (v2.0)
+
+```
+Une seule extraction pour tous les repos:
+  1. Découvre fichiers de TOUS les repos
+  2. Extrait en parallèle avec routing par source_file
+  3. Entries routées automatiquement vers DB cible
+
+→ Avantage: Extraction parallèle, rapide
+→ 1 extraction pour N repos
+→ Résolution FQN complète pour tous
+```
+
+### Gains de performance v2.0
+
+- Temps d'extraction : -40% (extraction parallèle)
+- Résolution FQN : 100% (tous repos dès le départ)
+- Mémoire : -50% (pas de DB temporaires)
+- Code : -30% (moins de duplication)
+
+## Formats de données
+
+### Entry format (standardisé)
+
+```python
+{
+  "document": "usage_type: symbol in context",  # Pour embeddings
+  "metadata": {
+    "source": "java" | "xml" | "typescript",
+    "source_file": "/absolute/path/to/file",
+    "usageType": "java_method_call" | "xml_trigger_calls_action" | ...,
+    "calleeSymbol": "methodName" | "actionName" | "fieldName",
+    "callerSymbol": "methodName" | "viewId:fieldName:onClick",
+    "callerUri": "/absolute/path/to/caller",
+    "callerLine": 42,
+    "calleeFqn": "com.example.Class.method",
+    "module": "module-name",
+    # ... autres champs spécifiques au type
+  }
+}
+```
+
+### Métadonnées de tracking
+
+```python
+{
+  "embedding_model_name": "all-MiniLM-L6-v2" | "none",
+  "document_strategy_version": "1.0" | "none",
+  "embedding_timestamp": "2025-01-15T10:30:00",
+  "scan_timestamp": "2025-01-15T10:30:00"
+}
+```
+
+## Scripts utilitaires
+
+### Regénérer les embeddings
+
+```bash
+python scripts/regenerate_embeddings.py
+```
+
+**Utilité** :
+- Convertir DB rapide → DB sémantique
+- Mettre à jour embeddings obsolètes
+- Traitement par batches pour grandes DBs
+
+### Nettoyer les caches
+
+```bash
+# Supprimer tous les caches Axelor
+rm -rf axelor-repos/*/. vector-*-db/
+
+# Supprimer cache d'une version spécifique
+rm -rf axelor-repos/axelor-open-platform-8.2.9/.vector-raw-db/
+```
+
+### Vérifier la santé de la DB
+
+```bash
+python StorageWriter.py --health
+```
+
+**Affiche** :
+- Nombre total d'entries
+- Pourcentage avec embeddings
+- Entries avec stratégie obsolète
+- Recommandations
+
+## Références
+
+- [JavaParser Documentation](https://javaparser.org/)
+- [ChromaDB Documentation](https://docs.trychroma.com/)
+- [Axelor Developer Guide](https://docs.axelor.com/)
+- [MCP Protocol Specification](https://modelcontextprotocol.io/)

@@ -22,6 +22,7 @@ class JavaASTExtractor:
     # JavaASTService configuration (internal)
     SERVICE_URL = "http://localhost:8765"
     MAX_WORKERS = 4  # Number of parallel repo extraction threads
+    FILE_WORKERS = 6  # Number of parallel file extractions per repo
 
     def __init__(self, repos: List[str]):
         """Initialize extractor
@@ -58,11 +59,14 @@ class JavaASTExtractor:
         # Launch gradle service in background
         try:
             # Use gradlew.bat on Windows, gradlew on Unix
-            gradle_cmd = "gradlew.bat" if sys.platform == "win32" else "./gradlew"
+            gradle_wrapper = service_dir / ("gradlew.bat" if sys.platform == "win32" else "gradlew")
+
+            if not gradle_wrapper.exists():
+                raise FileNotFoundError(f"Gradle wrapper not found: {gradle_wrapper}")
 
             # Start in background (detached process)
             subprocess.Popen(
-                [gradle_cmd, "service"],
+                [str(gradle_wrapper), "service"],
                 cwd=str(service_dir),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -86,11 +90,8 @@ class JavaASTExtractor:
                 f"Check logs in {service_dir}"
             )
 
-        except FileNotFoundError:
-            raise RuntimeError(
-                f"Gradle wrapper not found in {service_dir}\n"
-                f"Please ensure JavaASTService is properly set up"
-            )
+        except FileNotFoundError as e:
+            raise RuntimeError(str(e))
 
     def discover_java_files(self, repo: str) -> List[Path]:
         """Discover all Java files from a single repository
@@ -120,56 +121,23 @@ class JavaASTExtractor:
         print(f"    Found {len(java_files)} Java files")
         return java_files
 
-    def _extract_repo(self, repo: str, queue: Queue, limit: Optional[int] = None):
-        """Extract all Java entries from a single repository and push to queue
+    def _extract_file_task(self, java_file: Path, queue: Queue):
+        """Extract entries from a single Java file and push to queue (used for parallel processing)
 
         Args:
-            repo: Repository path
+            java_file: Path to Java file
             queue: Thread-safe queue to push entries to
-            limit: Optional limit on number of entries to extract from this repo
         """
-        print(f"\n[REPO] Processing repository: {repo}")
-        java_files = self.discover_java_files(repo)
-
-        if not java_files:
-            print(f"[REPO] No Java files found in {repo}")
-            return
-
-        total_files = len(java_files)
-        entry_count = 0
-        print(f"[REPO] Processing {total_files} Java files from {repo}")
-
-        for file_num, java_file in enumerate(java_files, 1):
-            # Check limit on entries
-            if limit is not None and entry_count >= limit:
-                print(f"\n[REPO] Reached limit of {limit} entries for {repo}")
-                break
-
-            # Progress indicator
-            progress_pct = int((file_num / total_files) * 100)
-            print(f"[REPO] {Path(repo).name} - {file_num}/{total_files} ({progress_pct}%) - {java_file.name}")
-
-            try:
-                file_entries = self.extract_from_file(java_file)
-                print(f"  Extracted {len(file_entries)} entries")
-
-                for entry in file_entries:
-                    if limit is None or entry_count < limit:
-                        queue.put(('java', entry))
-                        entry_count += 1
-                    else:
-                        break
-
-            except Exception as e:
-                print(f"  Error: {e}")
-
-        print(f"\n[REPO] {repo}: Extracted {entry_count} entries")
+        try:
+            self.extract_from_file(java_file, queue)
+        except Exception as e:
+            print(f"  Error extracting {java_file.name}: {e}")
 
     def extract_all(self, limit: Optional[int] = None) -> Iterator[Tuple[str, Dict]]:
-        """Generator that yields Java entries as they are extracted (parallelized by repo)
+        """Generator that yields Java entries as they are extracted (files processed in parallel)
 
         Args:
-            limit: Optional limit on number of ENTRIES to extract (None = all)
+            limit: Optional limit on number of ENTRIES to extract per repo (None = all)
 
         Yields:
             Tuples of ('java', entry_dict) where entry_dict contains 'document' and 'metadata'
@@ -180,59 +148,145 @@ class JavaASTExtractor:
             print("[JAVA] Warning: No repositories provided, nothing to extract")
             return
 
-        print(f"[JAVA] Extracting from {len(repos)} repositories in parallel (max_workers={self.MAX_WORKERS})")
+        print(f"[JAVA] Discovering Java files from {len(repos)} repositories...")
 
-        # Create thread-safe queue for entries
+        # Step 1: Discover all Java files from all repos, organized by repo
+        files_by_repo = {}
+        all_files = []
+        for repo in repos:
+            print(f"\n[REPO] Scanning: {repo}")
+            java_files = self.discover_java_files(repo)
+            repo_normalized = str(Path(repo).resolve()).replace('\\', '/')
+            files_by_repo[repo_normalized] = java_files
+            all_files.extend(java_files)
+
+        total_files = len(all_files)
+        print(f"\n[JAVA] Found {total_files} Java files total")
+        print(f"[JAVA] Extracting files in parallel (max_workers={self.FILE_WORKERS})...")
+
+        # Step 2: Extract files in parallel using a queue with per-repo limits
         entry_queue = Queue()
-        total_entries = 0
-        active_threads = len(repos)
+        total_yielded = 0
+        processed_files = 0
+        import time
+        start_time = time.time()
 
-        # Launch all extraction threads
-        with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as executor:
-            # Submit all repos for parallel extraction
+        # Track entries yielded per repo
+        repo_counters = {repo: 0 for repo in files_by_repo.keys()}
+
+        # Track file indices per repo
+        repo_file_indices = {repo: 0 for repo in files_by_repo.keys()}
+
+        with ThreadPoolExecutor(max_workers=self.FILE_WORKERS) as executor:
+            # Submit initial batch of files (one per worker)
+            # Workers can consume any file, we just need to track which repo each file belongs to
             futures = []
-            for repo in repos:
-                future = executor.submit(self._extract_repo, repo, entry_queue, limit)
-                futures.append(future)
+            submitted_count = 0
+            initial_batch_size = min(self.FILE_WORKERS, total_files)
 
-            # Read from queue and yield entries as they arrive
-            while active_threads > 0 or not entry_queue.empty():
-                # Check if any thread has finished
+            # Submit first N files across all repos
+            for repo, files in files_by_repo.items():
+                for i in range(len(files)):
+                    if submitted_count >= initial_batch_size:
+                        break
+                    future = executor.submit(self._extract_file_task, files[i], entry_queue)
+                    futures.append(future)
+                    repo_file_indices[repo] += 1
+                    submitted_count += 1
+                if submitted_count >= initial_batch_size:
+                    break
+
+            # Process results and submit new files dynamically
+            while futures or not entry_queue.empty():
+                # Check completed futures and submit new files from repos not at limit
                 for future in futures[:]:
                     if future.done():
                         futures.remove(future)
-                        active_threads -= 1
+                        processed_files += 1
+
+                        # Progress indicator every 50 files
+                        if processed_files % 50 == 0:
+                            progress_pct = int((processed_files / total_files) * 100)
+                            elapsed = time.time() - start_time
+                            elapsed_minutes = int(elapsed / 60)
+                            elapsed_seconds = int(elapsed % 60)
+                            if processed_files > 0:
+                                avg_time_per_file = elapsed / processed_files
+                                remaining_files = total_files - processed_files
+                                eta_seconds = avg_time_per_file * remaining_files
+                                eta_minutes = int(eta_seconds / 60)
+                                eta_seconds_rem = int(eta_seconds % 60)
+                                print(f"[JAVA] Processed {processed_files}/{total_files} files ({progress_pct}%) - Elapsed: {elapsed_minutes}m {elapsed_seconds}s - ETA: {eta_minutes}m {eta_seconds_rem}s")
+
                         try:
                             future.result()  # Check for exceptions
                         except Exception as e:
-                            print(f"\n[ERROR] Thread failed: {e}")
+                            print(f"  [ERROR] File extraction failed: {e}")
 
-                # Try to get entries from queue (non-blocking with timeout)
+                        # Submit next file from any repo that hasn't reached its limit
+                        for repo in files_by_repo.keys():
+                            if limit is None or repo_counters[repo] < limit:
+                                idx = repo_file_indices[repo]
+                                files = files_by_repo[repo]
+                                if idx < len(files):
+                                    next_future = executor.submit(self._extract_file_task, files[idx], entry_queue)
+                                    futures.append(next_future)
+                                    repo_file_indices[repo] += 1
+                                    submitted_count += 1
+                                    break  # Submit only 1 file per completed file
+
+                # Try to get entries from queue (non-blocking)
                 try:
                     entry = entry_queue.get(timeout=0.1)
 
-                    # Check global limit
-                    if limit is not None and total_entries >= limit:
-                        print(f"\n[JAVA] Reached global limit of {limit} entries")
-                        break
+                    # Find which repo this entry belongs to
+                    source_file = entry[1]['metadata'].get('source_file', '')
+                    source_file_normalized = str(Path(source_file).resolve()).replace('\\', '/')
 
-                    yield entry
-                    total_entries += 1
+                    entry_repo = None
+                    for repo in files_by_repo.keys():
+                        if source_file_normalized.startswith(repo):
+                            entry_repo = repo
+                            break
+
+                    # Check per-repo limit BEFORE yielding
+                    if entry_repo and (limit is None or repo_counters[entry_repo] < limit):
+                        yield entry
+                        total_yielded += 1
+                        repo_counters[entry_repo] += 1
+
+                        # Log every 500 entries
+                        if total_yielded % 500 == 0:
+                            remaining = total_files - submitted_count
+                            print(f"[JAVA] Yielded {total_yielded} entries (queue size: {entry_queue.qsize()}, {remaining} files remaining)")
+
+                    # Check if all repos reached their limit
+                    if limit is not None:
+                        all_repos_done = all(
+                            repo_counters[repo] >= limit or repo_file_indices[repo] >= len(files_by_repo[repo])
+                            for repo in files_by_repo.keys()
+                        )
+                        if all_repos_done and entry_queue.empty():
+                            print(f"\n[JAVA] All repos reached limit of {limit} entries, stopping...")
+                            for f in futures:
+                                f.cancel()
+                            return
 
                 except:
-                    # Queue is empty, continue checking threads
+                    # Queue is empty, continue
                     pass
 
-        print(f"\n[JAVA] Total: {total_entries} entries from {len(repos)} repositories")
+        print(f"\n[JAVA] Total: {total_yielded} entries from {processed_files} files")
 
-    def extract_from_file(self, java_file: Path) -> List[Dict]:
+    def extract_from_file(self, java_file: Path, queue: Optional[Queue] = None) -> Optional[List[Dict]]:
         """Extract all usages from a Java file
 
         Args:
             java_file: Path to Java file
+            queue: Optional queue to push entries to (if provided, returns None; otherwise returns list)
 
         Returns:
-            List of dicts with "document" and "metadata" keys
+            List of dicts with "document" and "metadata" keys (only if queue is None)
         """
         absolute_path = str(java_file.resolve())
 
@@ -268,15 +322,29 @@ class JavaASTExtractor:
                     raise RuntimeError(f"JavaParser failed: {errors[0]}")
 
         # Extract usages from successful results
-        entries = []
         for file_result in result.get('results', []):
             if file_result.get('success', False):
-                entries.extend(self._parse_usages(file_result))
+                file_path = file_result.get('file', '')
+                entries = self._parse_usages(file_result, file_path)
 
-        return entries
+                if queue is not None:
+                    # Push to queue
+                    for entry in entries:
+                        queue.put(('java', entry))
+                else:
+                    # Return as list (for backward compatibility)
+                    if 'all_entries' not in locals():
+                        all_entries = []
+                    all_entries.extend(entries)
 
-    def _parse_usages(self, file_result: dict) -> List[Dict]:
+        return all_entries if queue is None else None
+
+    def _parse_usages(self, file_result: dict, file_path: str) -> List[Dict]:
         """Parse JavaASTService result into standardized entries
+
+        Args:
+            file_result: Result dict from JavaASTService
+            file_path: Path to the source file
 
         Returns:
             List of dicts with "document" and "metadata" keys
@@ -284,6 +352,9 @@ class JavaASTExtractor:
         entries = []
 
         for metadata in file_result.get('usages', []):
+            # Add source_file to metadata for routing
+            metadata['source_file'] = file_path
+            metadata['source'] = 'java'  # Mark as Java source for filtering
             # Generate document text for embedding
             usage_type = metadata.get('usageType', metadata.get('usage_type', 'unknown'))
             callee_symbol = metadata.get('calleeSymbol', metadata.get('callee_name', ''))
