@@ -1,0 +1,56 @@
+// Gradle init script to list all Axelor dependencies with their resolved JAR paths
+// Usage: gradle --init-script list-dependencies.gradle listAxelorDeps
+
+gradle.projectsEvaluated {
+    rootProject {
+        task listAxelorDeps {
+            doLast {
+                // Map to store artifacts by group:name:version
+                def artifacts = [:]
+
+                // Get runtime JARs
+                configurations.runtimeClasspath.resolvedConfiguration.resolvedArtifacts.each { artifact ->
+                    def module = artifact.moduleVersion.id
+                    def group = module.group
+                    def name = module.name
+                    def version = module.version
+
+                    // Only Axelor packages
+                    if (group.startsWith('com.axelor')) {
+                        def key = "${group}:${name}:${version}"
+                        if (!artifacts.containsKey(key)) {
+                            artifacts[key] = [
+                                group: group,
+                                name: name,
+                                version: version,
+                                jar: artifact.file.absolutePath,
+                                sources: null
+                            ]
+                        }
+                    }
+                }
+
+                // Try to resolve sources for each artifact
+                artifacts.each { key, data ->
+                    try {
+                        def dependency = dependencies.create("${data.group}:${data.name}:${data.version}:sources")
+                        def sourcesConfig = configurations.detachedConfiguration(dependency)
+                        sourcesConfig.resolve().each { file ->
+                            if (file.name.endsWith('-sources.jar')) {
+                                data.sources = file.absolutePath
+                            }
+                        }
+                    } catch (Exception e) {
+                        // Sources not available, ignore
+                    }
+                }
+
+                // Output results
+                artifacts.each { key, data ->
+                    def sourcesPath = data.sources ?: 'NONE'
+                    println "AXELOR_DEP|${data.group}|${data.name}|${data.version}|${data.jar}|${sourcesPath}"
+                }
+            }
+        }
+    }
+}

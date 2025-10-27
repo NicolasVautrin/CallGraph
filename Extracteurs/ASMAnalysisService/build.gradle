@@ -1,0 +1,42 @@
+plugins {
+    id 'java'
+    id 'application'
+}
+
+group = 'com.callgraph'
+version = '1.0.0'
+
+sourceCompatibility = '11'
+targetCompatibility = '11'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // ASM for bytecode analysis
+    implementation 'org.ow2.asm:asm:9.6'
+    implementation 'org.ow2.asm:asm-tree:9.6'
+    implementation 'org.ow2.asm:asm-util:9.6'
+
+    // HTTP server
+    implementation 'com.sparkjava:spark-core:2.9.4'
+
+    // JSON processing (same as JavaASTService)
+    implementation 'com.fasterxml.jackson.core:jackson-databind:2.16.1'
+
+    // Logging
+    implementation 'org.slf4j:slf4j-simple:2.0.9'
+}
+
+application {
+    mainClass = 'ASMAnalysisService'
+    applicationDefaultJvmArgs = ['-Xmx2g']
+}
+
+task service(type: JavaExec) {
+    group = 'application'
+    description = 'Run ASM Analysis Service'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'ASMAnalysisService'
+}

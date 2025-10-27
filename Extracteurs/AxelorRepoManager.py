@@ -78,6 +78,40 @@ class AxelorRepoManager:
 
     def _detect_suite_version(self) -> Optional[str]:
         """Detect axelor-open-suite version from build files"""
+        # Check build.gradle for openSuiteVersion FIRST (most reliable)
+        build_gradle = self.project_root / "build.gradle"
+        if build_gradle.exists():
+            with open(build_gradle, 'r', encoding='utf-8') as f:
+                file_content = f.read()
+                # Pattern: ext.openSuiteVersion = '8.2.9'
+                match = re.search(r"ext\.openSuiteVersion\s*=\s*['\"]([0-9.]+)['\"]", file_content)
+                if match:
+                    return match.group(1)
+                # Pattern: version = '8.2.9' (in allprojects block)
+                match = re.search(r"^\s*version\s*=\s*['\"]([0-9.]+)['\"]", file_content, re.MULTILINE)
+                if match:
+                    return match.group(1)
+
+        # Check versions.gradle (used by some projects like multiplast)
+        versions_gradle = self.project_root / "versions.gradle"
+        if versions_gradle.exists():
+            with open(versions_gradle, 'r', encoding='utf-8') as f:
+                file_content = f.read()
+                # Pattern: ext.openSuiteVersion = '8.2.4'
+                match = re.search(r"ext\.openSuiteVersion\s*=\s*['\"]([0-9.]+)['\"]", file_content)
+                if match:
+                    return match.group(1)
+
+        # Check versions.gradle (used by some projects like multiplast)
+        versions_gradle = self.project_root / "versions.gradle"
+        if versions_gradle.exists():
+            with open(versions_gradle, 'r', encoding='utf-8') as f:
+                file_content = f.read()
+                # Pattern: ext.openSuiteVersion = '8.2.4'
+                match = re.search(r"ext\.openSuiteVersion\s*=\s*['\"]([0-9.]+)['\"]", file_content)
+                if match:
+                    return match.group(1)
+
         # Check gradle.properties
         gradle_props = self.project_root / "gradle.properties"
         if gradle_props.exists():
@@ -96,9 +130,9 @@ class AxelorRepoManager:
                     build_gradle = module_dir / "build.gradle"
                     if build_gradle.exists():
                         with open(build_gradle, 'r', encoding='utf-8') as f:
-                            content = f.read()
+                            file_content = f.read()
                             # Pattern: com.axelor:axelor-suite:8.2.9
-                            match = re.search(r'com\.axelor:axelor-.*:([0-9.]+)', content)
+                            match = re.search(r'com\.axelor:axelor-.*:([0-9.]+)', file_content)
                             if match:
                                 return match.group(1)
 

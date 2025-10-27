@@ -73,3 +73,28 @@ Thumbs.db
 *.bak
 *.swp
 *~
+
+# Gradle
+.gradle/
+*.lock
+gradle-app.setting
+!gradle-wrapper.jar
+
+# Java
+*.class
+
+# SQLite databases
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Claude Code
+.claude/
+
+# System files
+nul
+*.stackdump
+
+# IntelliJ IDEA (additional)
+.idea/misc.xml
