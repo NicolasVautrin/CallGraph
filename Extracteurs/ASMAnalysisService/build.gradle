@@ -25,7 +25,7 @@ dependencies {
     // JSON processing (same as JavaASTService)
     implementation 'com.fasterxml.jackson.core:jackson-databind:2.16.1'
 
-    // Logging
+    // Logging - SLF4J Simple
     implementation 'org.slf4j:slf4j-simple:2.0.9'
 }
 
@@ -39,4 +39,16 @@ task service(type: JavaExec) {
     description = 'Run ASM Analysis Service'
     classpath = sourceSets.main.runtimeClasspath
     mainClass = 'ASMAnalysisService'
+
+    // Configure SLF4J Simple Logger to log to file
+    systemProperty 'org.slf4j.simpleLogger.logFile', 'asm-service.log'
+    systemProperty 'org.slf4j.simpleLogger.defaultLogLevel', 'info'
+    systemProperty 'org.slf4j.simpleLogger.showDateTime', 'true'
+    systemProperty 'org.slf4j.simpleLogger.dateTimeFormat', 'yyyy-MM-dd HH:mm:ss'
+    systemProperty 'org.slf4j.simpleLogger.showThreadName', 'true'
+    systemProperty 'org.slf4j.simpleLogger.showLogName', 'true'
+
+    // Reduce Spark/Jetty noise
+    systemProperty 'org.slf4j.simpleLogger.log.spark', 'warn'
+    systemProperty 'org.slf4j.simpleLogger.log.org.eclipse.jetty', 'warn'
 }

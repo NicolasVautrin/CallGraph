@@ -1,5 +1,7 @@
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import spark.Request;
 import spark.Response;
 
@@ -25,6 +27,7 @@ import static spark.Spark.*;
  * Port: 8766
  */
 public class ASMAnalysisService {
+    private static final Logger logger = LoggerFactory.getLogger(ASMAnalysisService.class);
     private static final ObjectMapper mapper = new ObjectMapper();
     private static final int PORT = 8766;
 
@@ -47,6 +50,30 @@ public class ASMAnalysisService {
         // Lightweight indexing endpoint
         post("/index", ASMAnalysisService::index);
 
+        // Batch indexing endpoint
+        post("/index/batch", ASMAnalysisService::indexBatch);
+
+        // Shutdown endpoint
+        post("/shutdown", (req, res) -> {
+            res.type("application/json");
+            Map<String, Object> response = new HashMap<>();
+            response.put("status", "shutting down");
+            logger.info("Shutdown request received, stopping service...");
+
+            // Stop Spark in a separate thread to allow response to be sent
+            new Thread(() -> {
+                try {
+                    Thread.sleep(500); // Give time for response to be sent
+                    stop();
+                    System.exit(0);
+                } catch (InterruptedException e) {
+                    logger.error("Error during shutdown", e);
+                }
+            }).start();
+
+            return mapper.writeValueAsString(response);
+        });
+
         // Error handling
         exception(Exception.class, (e, req, res) -> {
             res.status(500);
@@ -62,11 +89,12 @@ public class ASMAnalysisService {
             e.printStackTrace();
         });
 
-        System.out.println("ASM Analysis Service started on port " + PORT);
-        System.out.println("Endpoints:");
-        System.out.println("  GET  /health   - Health check");
-        System.out.println("  POST /analyze  - Analyze class files");
-        System.out.println("  POST /index    - Index symbols (lightweight)");
+        logger.info("ASM Analysis Service started on port {}", PORT);
+        logger.info("Endpoints:");
+        logger.info("  GET  /health        - Health check");
+        logger.info("  POST /analyze       - Analyze class files");
+        logger.info("  POST /index         - Index symbols (single file)");
+        logger.info("  POST /index/batch   - Index symbols (batch)");
     }
 
     /**
@@ -234,7 +262,7 @@ public class ASMAnalysisService {
             classFiles = classFiles.subList(0, limit);
         }
 
-        System.out.println("Analyzing " + classFiles.size() + " class files");
+        logger.info("Analyzing {} class files", classFiles.size());
 
         // Analyze files
         List<Map<String, Object>> nodes = new ArrayList<>();
@@ -301,6 +329,9 @@ public class ASMAnalysisService {
                 Map<String, Object> methodData = new HashMap<>();
                 methodData.put("fqn", methodFqn);
                 methodData.put("lineNumber", node.get("lineNumber"));
+                methodData.put("modifiers", node.get("modifiers"));
+                methodData.put("hasOverride", node.get("hasOverride"));
+                methodData.put("isTransactional", node.get("isTransactional"));
                 methodData.put("returnType", null);
                 methodData.put("arguments", new ArrayList<String>());
                 methodData.put("calls", new ArrayList<Map<String, Object>>());
@@ -404,24 +435,29 @@ public class ASMAnalysisService {
     }
 
     /**
-     * Lightweight indexing endpoint - returns only symbols (fqn, uri, package)
+     * Lightweight indexing endpoint - returns grouped class symbols (excludes enums)
      *
      * Request body:
      * {
-     *   "packageRoots": ["/path/to/axelor-core-7.2.3"],
-     *   "limit": 100  // optional
+     *   "classFile": "/path/to/MyClass.class"
      * }
      *
-     * Response:
+     * Response (class/interface):
      * {
      *   "success": true,
+     *   "class_fqn": "com.example.MyClass",
+     *   "is_entity": false,
      *   "symbols": [
-     *     {
-     *       "fqn": "com.example.MyClass",
-     *       "uri": "file:///path/to/MyClass.java:10",
-     *       "package": "axelor-core-7.2.3"
-     *     }
+     *     {"fqn": "com.example.MyClass", "nodeType": "class", "line": 10, "isEntity": false},
+     *     {"fqn": "com.example.MyClass.myMethod()", "nodeType": "method", "line": 15, "isEntity": false}
      *   ]
+     * }
+     *
+     * Response (enum - skipped):
+     * {
+     *   "success": true,
+     *   "skipped": true,
+     *   "reason": "enum"
      * }
      */
     private static String index(Request req, Response res) throws IOException {
@@ -431,144 +467,214 @@ public class ASMAnalysisService {
         @SuppressWarnings("unchecked")
         Map<String, Object> request = mapper.readValue(req.body(), Map.class);
 
-        List<String> classDirs = new ArrayList<>();
-        Map<String, String> mapping = new HashMap<>();
-        Map<String, String> classDirToPackage = new HashMap<>();
-
-        // Option 1: packageRoots (auto-discover classes/ and sources/)
-        if (request.containsKey("packageRoots")) {
-            @SuppressWarnings("unchecked")
-            List<String> packageRoots = (List<String>) request.get("packageRoots");
-
-            for (String packageRoot : packageRoots) {
-                Path rootPath = Paths.get(packageRoot);
-                String packageName = rootPath.getFileName().toString();
-                Path classesPath = rootPath.resolve("classes");
-                Path sourcesPath = rootPath.resolve("sources");
-
-                if (Files.exists(classesPath) && Files.isDirectory(classesPath)) {
-                    String classesDirStr = classesPath.toString();
-                    classDirs.add(classesDirStr);
-                    classDirToPackage.put(classesDirStr, packageName);
-
-                    // Add mapping if sources exist
-                    if (Files.exists(sourcesPath) && Files.isDirectory(sourcesPath)) {
-                        mapping.put(classesDirStr, sourcesPath.toString());
-                    }
-                } else {
-                    System.err.println("Warning: classes/ not found in " + packageRoot);
-                }
-            }
-        }
-        // Option 2: explicit classDirs (backward compatibility)
-        else if (request.containsKey("classDirs")) {
-            @SuppressWarnings("unchecked")
-            List<String> explicitClassDirs = (List<String>) request.get("classDirs");
-            classDirs.addAll(explicitClassDirs);
-
-            if (request.containsKey("mapping")) {
-                @SuppressWarnings("unchecked")
-                Map<String, String> explicitMapping = (Map<String, String>) request.get("mapping");
-                mapping.putAll(explicitMapping);
-            }
-
-            // Extract package name from path for backward compatibility
-            for (String classDir : classDirs) {
-                Path classDirPath = Paths.get(classDir);
-                // Try to get package name from parent directory
-                Path parent = classDirPath.getParent();
-                if (parent != null) {
-                    classDirToPackage.put(classDir, parent.getFileName().toString());
-                } else {
-                    classDirToPackage.put(classDir, "unknown");
-                }
-            }
-        } else {
+        // classFile is required
+        if (!request.containsKey("classFile")) {
             res.status(400);
-            return mapper.writeValueAsString(Map.of("error", "Either packageRoots or classDirs is required"));
+            return mapper.writeValueAsString(Map.of("error", "classFile is required"));
         }
 
-        Integer limit = request.containsKey("limit") ?
-            ((Number) request.get("limit")).intValue() : null;
+        String classFilePath = (String) request.get("classFile");
 
-        // Get domains for filtering (default to empty list)
-        List<String> domains = new ArrayList<>();
-        if (request.containsKey("domains")) {
-            @SuppressWarnings("unchecked")
-            List<String> domainsList = (List<String>) request.get("domains");
-            domains.addAll(domainsList);
-        }
-
-        if (classDirs.isEmpty()) {
+        // Validate class file
+        Path classFile = Paths.get(classFilePath);
+        if (!Files.exists(classFile) || !classFilePath.endsWith(".class")) {
             res.status(400);
-            return mapper.writeValueAsString(Map.of("error", "No valid class directories found"));
+            return mapper.writeValueAsString(Map.of("error", "Invalid class file: " + classFilePath));
         }
 
-        // Collect all .class files
-        List<Path> classFiles = new ArrayList<>();
-        for (String dirPath : classDirs) {
-            Path dir = Paths.get(dirPath);
-            if (Files.exists(dir) && Files.isDirectory(dir)) {
-                Files.walk(dir)
-                    .filter(p -> p.toString().endsWith(".class"))
-                    .forEach(classFiles::add);
-            }
-        }
+        logger.info("Indexing class file: {}", classFile);
 
-        // Apply limit if specified
-        if (limit != null && classFiles.size() > limit) {
-            classFiles = classFiles.subList(0, limit);
-        }
-
-        System.out.println("Indexing " + classFiles.size() + " class files");
-
-        // Extract symbols only (lightweight)
+        // Extract symbols
+        String classFqn = null;
+        boolean isEntity = false;
         List<Map<String, Object>> symbols = new ArrayList<>();
 
-        for (Path classFile : classFiles) {
+        try {
+            ClassAnalyzer analyzer = new ClassAnalyzer(classFile);
+            analyzer.analyze();
+
+            // First pass: find the class node and check if it's an enum
+            for (Map<String, Object> node : analyzer.getNodes()) {
+                String nodeType = (String) node.get("nodeType");
+
+                if ("enum".equals(nodeType)) {
+                    // Skip enums entirely
+                    Map<String, Object> response = new HashMap<>();
+                    response.put("success", true);
+                    response.put("skipped", true);
+                    response.put("reason", "enum");
+                    return mapper.writeValueAsString(response);
+                }
+
+                if ("class".equals(nodeType) || "interface".equals(nodeType)) {
+                    classFqn = (String) node.get("fqn");
+                    isEntity = node.get("isEntity") != null && (Boolean) node.get("isEntity");
+                    break;
+                }
+            }
+
+            // Second pass: collect all symbols (class + methods)
+            for (Map<String, Object> node : analyzer.getNodes()) {
+                String nodeType = (String) node.get("nodeType");
+                String fqn = (String) node.get("fqn");
+
+                Map<String, Object> symbol = new HashMap<>();
+                symbol.put("fqn", fqn);
+                symbol.put("nodeType", nodeType);
+                symbol.put("line", node.get("lineNumber"));
+                symbol.put("isEntity", isEntity); // Use class's isEntity for all symbols
+                symbols.add(symbol);
+            }
+        } catch (Exception e) {
+            res.status(500);
+            return mapper.writeValueAsString(Map.of("error", "Failed to index " + classFile + ": " + e.getMessage()));
+        }
+
+        // Build grouped response
+        Map<String, Object> response = new HashMap<>();
+        response.put("success", true);
+        response.put("class_fqn", classFqn);
+        response.put("is_entity", isEntity);
+        response.put("symbols", symbols);
+
+        return mapper.writeValueAsString(response);
+    }
+
+    /**
+     * Batch indexing endpoint - indexes multiple class files in one request
+     *
+     * Request body:
+     * {
+     *   "classFiles": ["/path/to/Class1.class", "/path/to/Class2.class", ...]
+     * }
+     *
+     * Response:
+     * {
+     *   "success": true,
+     *   "results": [
+     *     {
+     *       "success": true,
+     *       "class_fqn": "com.example.Class1",
+     *       "is_entity": false,
+     *       "symbols": [...]
+     *     },
+     *     {
+     *       "success": true,
+     *       "skipped": true,
+     *       "reason": "enum"
+     *     },
+     *     {
+     *       "success": false,
+     *       "error": "Failed to index: ..."
+     *     }
+     *   ]
+     * }
+     */
+    private static String indexBatch(Request req, Response res) throws IOException {
+        res.type("application/json");
+
+        // Parse request
+        @SuppressWarnings("unchecked")
+        Map<String, Object> request = mapper.readValue(req.body(), Map.class);
+
+        // classFiles is required
+        if (!request.containsKey("classFiles")) {
+            res.status(400);
+            return mapper.writeValueAsString(Map.of("error", "classFiles array is required"));
+        }
+
+        @SuppressWarnings("unchecked")
+        List<String> classFilePaths = (List<String>) request.get("classFiles");
+
+        if (classFilePaths == null || classFilePaths.isEmpty()) {
+            res.status(400);
+            return mapper.writeValueAsString(Map.of("error", "classFiles array cannot be empty"));
+        }
+
+        logger.info("Batch indexing {} class files", classFilePaths.size());
+
+        List<Map<String, Object>> results = new ArrayList<>();
+
+        // Process each class file
+        for (String classFilePath : classFilePaths) {
+            Map<String, Object> result = new HashMap<>();
+
             try {
+                // Validate class file
+                Path classFile = Paths.get(classFilePath);
+                if (!Files.exists(classFile) || !classFilePath.endsWith(".class")) {
+                    result.put("success", false);
+                    result.put("error", "Invalid class file: " + classFilePath);
+                    results.add(result);
+                    continue;
+                }
+
+                // Extract symbols
+                String classFqn = null;
+                boolean isEntity = false;
+                boolean isEnum = false;
+                List<Map<String, Object>> symbols = new ArrayList<>();
+
                 ClassAnalyzer analyzer = new ClassAnalyzer(classFile);
                 analyzer.analyze();
 
-                // Determine which package this class belongs to
-                String packageName = "unknown";
-                for (Map.Entry<String, String> entry : classDirToPackage.entrySet()) {
-                    if (classFile.toString().startsWith(entry.getKey())) {
-                        packageName = entry.getValue();
+                // First pass: find the class node and check if it's an enum
+                for (Map<String, Object> node : analyzer.getNodes()) {
+                    String nodeType = (String) node.get("nodeType");
+
+                    if ("enum".equals(nodeType)) {
+                        // Skip enums entirely
+                        isEnum = true;
+                        break;
+                    }
+
+                    if ("class".equals(nodeType) || "interface".equals(nodeType)) {
+                        classFqn = (String) node.get("fqn");
+                        isEntity = node.get("isEntity") != null && (Boolean) node.get("isEntity");
                         break;
                     }
                 }
 
-                // Extract only FQN from nodes (classes only)
+                // If it's an enum, mark as skipped and continue to next file
+                if (isEnum) {
+                    result.put("success", true);
+                    result.put("skipped", true);
+                    result.put("reason", "enum");
+                    results.add(result);
+                    continue;
+                }
+
+                // Second pass: collect all symbols (class + methods)
                 for (Map<String, Object> node : analyzer.getNodes()) {
                     String nodeType = (String) node.get("nodeType");
-
-                    // Only index classes, not methods
-                    if (!"class".equals(nodeType) && !"interface".equals(nodeType) && !"enum".equals(nodeType)) {
-                        continue;
-                    }
-
                     String fqn = (String) node.get("fqn");
-
-                    // Filter by domain
-                    if (!matchesDomainFilter(fqn, domains)) {
-                        continue; // Skip this symbol
-                    }
 
                     Map<String, Object> symbol = new HashMap<>();
                     symbol.put("fqn", fqn);
-                    symbol.put("package", packageName);
+                    symbol.put("nodeType", nodeType);
+                    symbol.put("line", node.get("lineNumber"));
+                    symbol.put("isEntity", isEntity);
                     symbols.add(symbol);
                 }
+
+                // Build result for this file
+                result.put("success", true);
+                result.put("class_fqn", classFqn);
+                result.put("is_entity", isEntity);
+                result.put("symbols", symbols);
+                results.add(result);
+
             } catch (Exception e) {
-                System.err.println("Failed to index " + classFile + ": " + e.getMessage());
+                result.put("success", false);
+                result.put("error", "Failed to index " + classFilePath + ": " + e.getMessage());
+                results.add(result);
             }
         }
 
-        // Build response
+        // Build batch response
         Map<String, Object> response = new HashMap<>();
         response.put("success", true);
-        response.put("symbols", symbols);
+        response.put("results", results);
 
         return mapper.writeValueAsString(response);
     }

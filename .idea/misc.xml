@@ -3,6 +3,10 @@
   <component name="Black">
     <option name="sdkName" value="Python 3.12 (CallGraph)" />
   </component>
+  <component name="FrameworkDetectionExcludesConfiguration">
+    <file type="web" url="file://$PROJECT_DIR$/axelor-repos/axelor-open-platform-7.2.3/axelor-tomcat/src/main/resources/conf/web.xml" />
+    <file type="web" url="file://$PROJECT_DIR$/axelor-repos/axelor-open-platform-7.2.3/axelor-web/src/main/webapp/WEB-INF/web.xml" />
+  </component>
   <component name="ProjectRootManager" version="2" project-jdk-name="Python 3.12 (CallGraph)" project-jdk-type="Python SDK">
     <output url="file://$PROJECT_DIR$/out" />
   </component>

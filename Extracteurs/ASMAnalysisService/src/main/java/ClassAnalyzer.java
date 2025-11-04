@@ -46,6 +46,15 @@ public class ClassAnalyzer extends ClassVisitor {
         this.isAbstract = (access & Opcodes.ACC_ABSTRACT) != 0;
         this.modifiers = parseModifiers(access);
 
+        // Detect if this class is an Axelor entity (extends AuditableModel)
+        boolean isEntity = false;
+        if (superName != null) {
+            String superFqn = superName.replace('/', '.');
+            // Check if extends AuditableModel (direct or via package convention)
+            isEntity = superFqn.contains("AuditableModel") ||
+                       (className.contains(".db.") && !className.equals("com.axelor.db.Model"));
+        }
+
         // Create class node
         Map<String, Object> classNode = new HashMap<>();
         classNode.put("fqn", className);
@@ -54,6 +63,7 @@ public class ClassAnalyzer extends ClassVisitor {
         classNode.put("isInterface", isInterface);
         classNode.put("isEnum", isEnum);
         classNode.put("isAbstract", isAbstract);
+        classNode.put("isEntity", isEntity);
         nodes.add(classNode);
 
         // Inheritance edges
@@ -107,6 +117,9 @@ public class ClassAnalyzer extends ClassVisitor {
                                       String signature, String[] exceptions) {
         String methodFqn = className + "." + name + descriptorToSignature(descriptor);
 
+        // Extract method modifiers (visibility, static, final, etc.)
+        List<String> methodModifiers = parseModifiers(access);
+
         // Parse method signature for types (return and arguments)
         Type methodType = Type.getMethodType(descriptor);
 
@@ -151,8 +164,8 @@ public class ClassAnalyzer extends ClassVisitor {
             }
         }
 
-        // Return MethodAnalyzer to track method body and line numbers
-        return new MethodAnalyzer(methodFqn);
+        // Return MethodAnalyzer to track method body, line numbers, and annotations
+        return new MethodAnalyzer(methodFqn, methodModifiers);
     }
 
     /**
@@ -164,7 +177,7 @@ public class ClassAnalyzer extends ClassVisitor {
         private int methodStartLine = -1;
         private Map<String, Object> methodNode;
 
-        public MethodAnalyzer(String currentMethodFqn) {
+        public MethodAnalyzer(String currentMethodFqn, List<String> modifiers) {
             super(Opcodes.ASM9);
             this.currentMethodFqn = currentMethodFqn;
 
@@ -174,6 +187,9 @@ public class ClassAnalyzer extends ClassVisitor {
             methodNode.put("fqn", currentMethodFqn);
             methodNode.put("nodeType", "method");
             methodNode.put("lineNumber", -1);  // Will be updated if line info available
+            methodNode.put("modifiers", modifiers);
+            methodNode.put("hasOverride", false);  // Will be updated if @Override found
+            methodNode.put("isTransactional", false);  // Will be updated if @Transactional found
             nodes.add(methodNode);
             logger.info("[METHOD_NODE_CREATED] {} (total nodes: {})", currentMethodFqn, nodes.size());
 
@@ -184,6 +200,25 @@ public class ClassAnalyzer extends ClassVisitor {
             memberEdge.put("toFqn", className);
             memberEdge.put("kind", "method");
             edges.add(memberEdge);
+        }
+
+        @Override
+        public AnnotationVisitor visitAnnotation(String descriptor, boolean visible) {
+            // Detect @Override annotation
+            if ("Ljava/lang/Override;".equals(descriptor)) {
+                methodNode.put("hasOverride", true);
+                logger.info("[ANNOTATION] @Override detected on {}", currentMethodFqn);
+            }
+
+            // Detect @Transactional annotation (Spring or Jakarta)
+            if ("Lorg/springframework/transaction/annotation/Transactional;".equals(descriptor) ||
+                "Ljavax/transaction/Transactional;".equals(descriptor) ||
+                "Ljakarta/transaction/Transactional;".equals(descriptor)) {
+                methodNode.put("isTransactional", true);
+                logger.info("[ANNOTATION] @Transactional detected on {}", currentMethodFqn);
+            }
+
+            return super.visitAnnotation(descriptor, visible);
         }
 
         @Override
