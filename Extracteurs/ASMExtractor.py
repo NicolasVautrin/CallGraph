@@ -349,22 +349,31 @@ class ASMExtractor:
             files_to_index = []
             skipped = 0
 
+            # Step 1: Generate all relative_uri for batch query
+            relative_uri_map = {}  # relative_uri -> class_file
+            for class_file in all_class_files:
+                relative_uri = str(class_file.relative_to(classes_dir)).replace('\\', '/')
+                relative_uri_map[relative_uri] = class_file
+
+            # Step 2: Batch query to get is_entity for all relative_uri
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
 
-            for class_file in all_class_files:
-                # Calculate relative_uri: com/axelor/db/Model.class
-                relative_uri = str(class_file.relative_to(classes_dir)).replace('\\', '/')
+            # Build IN clause with placeholders
+            placeholders = ','.join('?' * len(relative_uri_map))
+            query = f"SELECT relative_uri, is_entity FROM symbol_index WHERE relative_uri IN ({placeholders})"
 
-                # Check if already indexed
-                cursor.execute(
-                    "SELECT is_entity FROM symbol_index WHERE relative_uri = ?",
-                    (relative_uri,)
-                )
-                existing = cursor.fetchone()
+            cursor.execute(query, list(relative_uri_map.keys()))
+            existing_symbols = cursor.fetchall()
+            conn.close()
 
-                if existing:
-                    is_entity = existing[0]
+            # Step 3: Build lookup dict for fast access
+            existing_map = {row[0]: row[1] for row in existing_symbols}  # relative_uri -> is_entity
+
+            # Step 4: Filter files based on batch results
+            for relative_uri, class_file in relative_uri_map.items():
+                if relative_uri in existing_map:
+                    is_entity = existing_map[relative_uri]
                     if not is_entity:
                         # Already indexed and NOT an entity → SKIP
                         skipped += 1
@@ -373,8 +382,6 @@ class ASMExtractor:
 
                 # New file or entity to override → add to indexing queue
                 files_to_index.append(class_file)
-
-            conn.close()
 
             print(f"[ASM]   Deduplication: {len(files_to_index)} to index, {skipped} skipped")
 
@@ -716,38 +723,45 @@ class ASMExtractor:
             if not package_path.exists():
                 continue
 
-            # Find all .class files (limit per package)
+            # Step 1: Collect all .class files and generate relative_uri
+            all_class_files = list(package_path.rglob('*.class'))
+
+            # Map: relative_uri -> class_file path
+            relative_uri_to_file = {}
+            for class_file in all_class_files:
+                try:
+                    # Extract relative path from package_path (classes directory)
+                    relative_uri = str(class_file.relative_to(package_path)).replace('\\', '/')
+                    relative_uri_to_file[relative_uri] = class_file
+                except Exception as e:
+                    print(f"[ASM]   Warning: Could not compute relative_uri for {class_file}: {e}")
+                    continue
+
+            # Step 2: Batch query to get all relative_uri for this package from symbol_index
+            if not relative_uri_to_file:
+                continue
+
+            placeholders = ','.join('?' * len(relative_uri_to_file))
+            query = f"SELECT relative_uri FROM symbol_index WHERE package = ? AND relative_uri IN ({placeholders})"
+
+            cursor.execute(query, [package_name] + list(relative_uri_to_file.keys()))
+            valid_relative_uris = {row[0] for row in cursor.fetchall()}
+
+            # Step 3: Yield files that match valid relative_uri (with optional limit)
             count = 0
             skipped = 0
-            for class_file in package_path.rglob('*.class'):
-                # Build relative_uri from file path
-                # e.g., /path/to/axelor-core/classes/com/axelor/db/Model.class
-                #    -> com/axelor/db/Model.class
-                try:
-                    class_file_str = str(class_file).replace('\\', '/')
 
-                    # Check if this .class file path ends with a relative_uri from this package
-                    cursor.execute(
-                        "SELECT 1 FROM symbol_index WHERE package = ? AND ? LIKE '%' || relative_uri",
-                        (package_name, class_file_str)
-                    )
-                    result = cursor.fetchone()
+            for relative_uri, class_file in relative_uri_to_file.items():
+                if relative_uri in valid_relative_uris:
+                    # This .class file is in symbol_index for this package
+                    yield str(class_file.resolve())
+                    count += 1
 
-                    if result:
-                        # This .class file was selected during deduplication for this package
-                        yield str(class_file.resolve())
-                        count += 1
-
-                        if limit and count >= limit:
-                            break  # Move to next package
-                    else:
-                        # Skip this .class file (duplicate - selected from another package)
-                        skipped += 1
-
-                except Exception as e:
-                    # If we can't determine relative_uri, skip the file
-                    print(f"[ASM]   Warning: Could not process {class_file}: {e}")
-                    continue
+                    if limit and count >= limit:
+                        break  # Move to next package
+                else:
+                    # Skip this .class file (not in symbol_index for this package)
+                    skipped += 1
 
             if skipped > 0:
                 print(f"[ASM]   Skipped {skipped} duplicate class files from {package_name}")

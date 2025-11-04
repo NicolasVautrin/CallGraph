@@ -189,9 +189,15 @@ ASMExtractor(db_path=".callgraph.db", service_url="http://localhost:8766", init=
 - `extract()`: Extracts call graph from bytecode
 
 **Performance**:
-- Symbol indexing: ~10-20 seconds for 39 packages (90k symbols)
-- Call graph extraction: ~5-10 minutes for 3000 .class files
+- Symbol indexing: ~6 minutes for 39 packages (107k symbols, 9.4k classes)
+- Call graph extraction: ~40 seconds for 9,466 .class files (252 files/sec)
+- Total extraction (--init): ~6-7 minutes complete project
 - Incremental mode: Only re-extracts modified packages (70%+ speedup on subsequent runs)
+
+**Optimizations**:
+- Batch SQL queries (IN clauses): 99.95% reduction in database queries
+- Before: ~650k queries → After: ~220 queries
+- Insertions by batches of 5000 rows
 
 ---
 
@@ -307,18 +313,34 @@ ORDER BY package, line;
 
 ## Performance
 
-### Extraction Times
+### Extraction Times (Real Project - 39 Packages)
 
-- Symbol indexing: ~10-20 seconds for 39 packages
-- Call graph extraction: ~5-10 minutes for 3000 .class files
-- With cache: ~10 minutes total (70% speedup)
+**Full Extraction (--init)**: ~6-7 minutes total
+- STEP 1 (Gradle discovery): ~10 seconds
+- STEP 2 (Symbol indexing): ~6 minutes for 107k symbols
+- STEP 3 (Call graph extraction): ~40 seconds for 9,466 .class files (252 files/sec)
 
-### Database Sizes
+**Incremental Mode**: Only re-extracts modified packages (70%+ speedup)
 
-- Platform v8.2.x: ~15 MB, ~90,000 symbols
-- Suite v8.2.x: ~25 MB, ~210,000 symbols
-- Local (typical): ~10 MB, ~160,000 symbols
-- **Total**: ~50 MB, ~460,000 symbols
+### Database Stats
+
+**Real Project Example**:
+- **Size**: ~292 MB
+- **Symbols**: 107,312 (9,466 classes + 97,846 methods)
+- **Edges**: 319,272 (calls, inheritance, member_of)
+- **Packages**: 39 Axelor packages
+- **Entities**: 2,089 (22% of classes)
+
+**Database Contents**:
+- `symbol_index`: 107,312 rows (~60 MB)
+- `nodes`: 94,267 rows (~52 MB)
+- `edges`: 319,272 rows (~180 MB)
+
+### Query Performance
+
+- Simple queries (COUNT, SELECT WHERE): ~10ms
+- Complex joins (call chains): ~50-100ms
+- Full-text search (LIKE): ~20-30ms
 
 ---
 

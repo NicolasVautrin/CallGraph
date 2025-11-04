@@ -258,10 +258,25 @@ axelor-repos/
 
 ## Performance
 
-**Index** : ~10-20s pour 39 packages (90k symboles)
-**Extraction** : ~5-10 min pour 3000 .class files
+**Extraction complète (--init)** : ~6-7 min pour projet complet
+- 39 packages Axelor (9,466 fichiers .class)
+- 107k symboles indexés (9.4k classes + 98k méthodes)
+- 319k edges (appels, héritage, member_of)
+- Taille base : ~292 MB
+
+**Détail par étape** :
+- STEP 1 (découverte Gradle) : ~10s
+- STEP 2 (indexation symboles) : ~6 min
+- STEP 3 (extraction call graph) : ~40s (252 fichiers/sec)
+
 **Mode incrémental** : Ne réextrait que les packages modifiés (70%+ speedup sur runs suivants)
 **Mode --init** : Extraction complète from scratch (utiliser pour schema changes)
+
+**Optimisations** :
+- Requêtes SQL batchées (IN clauses) : 99.95% de réduction des requêtes
+- Avant : ~650k requêtes → Après : ~220 requêtes
+- Insertion par batches de 5000 lignes
+- Index SQLite sur fqn, package, relative_uri
 
 ## Résolution de problèmes
 
