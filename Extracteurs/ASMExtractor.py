@@ -34,82 +34,218 @@ from datetime import datetime
 class ASMExtractor:
     """Client for ASMAnalysisService with SQLite symbol resolution"""
 
-    def __init__(self, db_path: str = ".callgraph.db", service_url: str = "http://localhost:8766"):
+    def __init__(self, db_path: str = ".callgraph.db", service_url: str = "http://localhost:8766", init: bool = False):
         """
         Initialize ASM extractor
 
         Args:
             db_path: Path to SQLite database
             service_url: URL of ASMAnalysisService
+            init: If True, drop and recreate all tables (full reset). If False (default), create tables if they don't exist (incremental mode)
         """
         self.db_path = db_path
         self.service_url = service_url
         self.conn = sqlite3.connect(db_path)
         self.conn.row_factory = sqlite3.Row
-        self._ensure_extraction_tables()
+
+        if init:
+            # INIT mode: full reset
+            self.init_database()
+        else:
+            # Incremental mode: create tables if they don't exist
+            self._ensure_extraction_tables()
+            self._ensure_symbol_index_table()
 
     def _ensure_extraction_tables(self):
         """Create nodes and edges tables if they don't exist"""
         cursor = self.conn.cursor()
 
-        # Nodes table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS nodes (
-                fqn TEXT PRIMARY KEY NOT NULL,
-                type TEXT NOT NULL,
-                package TEXT NOT NULL,
-                line INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
+        try:
+            cursor.execute("BEGIN")
 
-        # Edges table with from_package and to_package
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS edges (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                from_fqn TEXT NOT NULL,
-                edge_type TEXT NOT NULL,
-                to_fqn TEXT NOT NULL,
-                kind TEXT,
-                from_package TEXT NOT NULL,
-                to_package TEXT NOT NULL,
-                from_line INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
+            # Nodes table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS nodes (
+                    fqn TEXT PRIMARY KEY NOT NULL,
+                    type TEXT NOT NULL,
+                    package TEXT NOT NULL,
+                    line INTEGER,
+                    visibility TEXT,
+                    has_override BOOLEAN,
+                    is_transactional BOOLEAN,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
 
-        # Indexes
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_nodes_package ON nodes(package)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(edge_type)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_fqn)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_fqn)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_edges_from_package ON edges(from_package)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_edges_to_package ON edges(to_package)')
+            # Edges table with from_package and to_package
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS edges (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    from_fqn TEXT NOT NULL,
+                    edge_type TEXT NOT NULL,
+                    to_fqn TEXT NOT NULL,
+                    kind TEXT,
+                    from_package TEXT NOT NULL,
+                    to_package TEXT NOT NULL,
+                    from_line INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
 
-        self.conn.commit()
+            # Indexes
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_nodes_package ON nodes(package)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(edge_type)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_fqn)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_fqn)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_edges_from_package ON edges(from_package)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_edges_to_package ON edges(to_package)')
+
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            raise Exception(f"Failed to create extraction tables: {e}")
 
     def _ensure_symbol_index_table(self):
         """Create symbol_index and index_metadata tables if they don't exist"""
         cursor = self.conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS symbol_index (
-                fqn TEXT PRIMARY KEY,
-                uri TEXT NOT NULL,
-                package TEXT NOT NULL
-            )
-        ''')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_symbol_package ON symbol_index(package)')
 
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS index_metadata (
-                package TEXT PRIMARY KEY,
-                content_hash TEXT NOT NULL,
-                indexed_at TIMESTAMP NOT NULL
+        try:
+            cursor.execute("BEGIN")
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS symbol_index (
+                    fqn TEXT PRIMARY KEY,
+                    uri TEXT NOT NULL,
+                    package TEXT NOT NULL,
+                    relative_uri TEXT,
+                    is_entity BOOLEAN NOT NULL DEFAULT 0,
+                    line INTEGER
+                )
+            ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_symbol_package ON symbol_index(package)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_symbol_relative_uri ON symbol_index(relative_uri)')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS index_metadata (
+                    package TEXT PRIMARY KEY,
+                    content_hash TEXT NOT NULL,
+                    indexed_at TIMESTAMP NOT NULL
+                )
+            ''')
+
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            raise Exception(f"Failed to create symbol index tables: {e}")
+
+    def init_database(self):
+        """
+        Initialize database in INIT mode:
+        - Drop all existing tables (handles schema changes)
+        - Recreate all tables from scratch
+
+        Use this for:
+        - First-time database creation
+        - After schema changes
+        - When --init flag is used
+        """
+        cursor = self.conn.cursor()
+
+        try:
+            print("[INIT] Dropping all existing tables...")
+            cursor.execute("BEGIN")
+            cursor.execute("DROP TABLE IF EXISTS symbol_index")
+            cursor.execute("DROP TABLE IF EXISTS index_metadata")
+            cursor.execute("DROP TABLE IF EXISTS nodes")
+            cursor.execute("DROP TABLE IF EXISTS edges")
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            raise Exception(f"Failed to drop tables: {e}")
+
+        print("[INIT] Creating fresh tables...")
+        self._ensure_extraction_tables()
+        self._ensure_symbol_index_table()
+
+        print("[INIT] Database initialized (all caches cleared)")
+
+    def clean_package_data(self, package_name: str):
+        """
+        Clean all data related to a specific package (used during symbol indexing):
+        - Remove symbols from symbol_index
+        - Remove nodes (classes/methods) from nodes table
+        - Remove edges where from_package OR to_package matches
+        - Remove metadata to force re-indexing
+
+        Args:
+            package_name: Package name to clean (e.g., 'vpauto-8.2.9')
+        """
+        cursor = self.conn.cursor()
+
+        print(f"[CLEAN] Removing data for package: {package_name}")
+
+        try:
+            cursor.execute("BEGIN")
+
+            # Remove symbol index entries
+            cursor.execute("DELETE FROM symbol_index WHERE package = ?", (package_name,))
+            symbols_deleted = cursor.rowcount
+
+            # Remove nodes
+            cursor.execute("DELETE FROM nodes WHERE package = ?", (package_name,))
+            nodes_deleted = cursor.rowcount
+
+            # Remove edges (from OR to this package)
+            cursor.execute(
+                "DELETE FROM edges WHERE from_package = ? OR to_package = ?",
+                (package_name, package_name)
             )
-        ''')
-        self.conn.commit()
+            edges_deleted = cursor.rowcount
+
+            # Remove metadata (forces re-indexing)
+            cursor.execute("DELETE FROM index_metadata WHERE package = ?", (package_name,))
+
+            self.conn.commit()
+
+            print(f"[CLEAN]   Deleted: {symbols_deleted} symbols, {nodes_deleted} nodes, {edges_deleted} edges")
+        except Exception as e:
+            self.conn.rollback()
+            raise Exception(f"Failed to clean package data for {package_name}: {e}")
+
+    def clean_extraction_data(self, package_name: str):
+        """
+        Clean ONLY extraction data (nodes/edges) for a package, keeping symbol_index intact.
+        Used during call graph extraction where symbol_index is needed for package resolution.
+
+        Args:
+            package_name: Package name to clean (e.g., 'vpauto-8.2.9')
+        """
+        cursor = self.conn.cursor()
+
+        print(f"[CLEAN] Removing extraction data for package: {package_name}")
+
+        try:
+            cursor.execute("BEGIN")
+
+            # Remove nodes
+            cursor.execute("DELETE FROM nodes WHERE package = ?", (package_name,))
+            nodes_deleted = cursor.rowcount
+
+            # Remove edges (from OR to this package)
+            cursor.execute(
+                "DELETE FROM edges WHERE from_package = ? OR to_package = ?",
+                (package_name, package_name)
+            )
+            edges_deleted = cursor.rowcount
+
+            self.conn.commit()
+
+            print(f"[CLEAN]   Deleted: {nodes_deleted} nodes, {edges_deleted} edges")
+        except Exception as e:
+            self.conn.rollback()
+            raise Exception(f"Failed to clean extraction data for {package_name}: {e}")
 
     def build_symbol_index(self, axelor_repos_dir: str, packages: List[str] = None, domains: List[str] = None, project_root: str = None, local_packages: List[str] = None):
         """
@@ -129,7 +265,6 @@ class ASMExtractor:
             print(f"[ASM] Domain filter: {', '.join(domains)}")
         if local_packages:
             print(f"[ASM] Local packages (will fix URIs): {', '.join(local_packages)}")
-        self._ensure_symbol_index_table()
 
         axelor_repos = Path(axelor_repos_dir)
         if not axelor_repos.exists():
@@ -159,26 +294,35 @@ class ASMExtractor:
 
             print(f"[ASM] Indexing {package_name}...")
 
-            # Analyze package (just to extract symbols)
-            package_path = str(package_dir.resolve()).replace('\\', '/')
-            symbols = self._index_package(package_path, package_name, domains)
+            # Note: In --init mode, all packages are reindexed from scratch
+            # TODO: Implement incremental mode later (requires smarter dedup logic)
 
-            if symbols:
-                total_symbols += len(symbols)
-                # Compute and store hash
-                content_hash = self._compute_package_hash(package_dir / "classes")
-                self._store_symbols(symbols, package_name, content_hash)
-                print(f"[ASM]   -> {len(symbols)} symbols indexed")
+            # Analyze package (returns list of classes with grouped symbols)
+            package_path = str(package_dir.resolve()).replace('\\', '/')
+            classes_list = self._index_package(package_path, package_name, domains)
+
+            if classes_list:
+                # Store all classes and their symbols
+                stored_count = self._store_symbols(classes_list, package_name)
+                total_symbols += stored_count
+                print(f"[ASM]   -> {len(classes_list)} classes indexed")
 
         # Fix URIs for local packages
         if project_root and local_packages:
             self._fix_local_package_uris(project_root, local_packages)
 
+        # Verify actual count in database
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM symbol_index")
+        actual_count = cursor.fetchone()[0]
+
         print(f"[ASM] Symbol index complete: {total_symbols} total symbols ({skipped} packages skipped)")
+        print(f"[ASM] Database contains: {actual_count} symbols (difference: {total_symbols - actual_count})")
 
     def _index_package(self, package_path: str, package_name: str, domains: List[str] = None) -> List[Dict]:
         """
-        Index a single package (extract FQN → URI mapping)
+        Index a single package - class by class with deduplication BEFORE ASM analysis
+        Returns symbols grouped by class
 
         Args:
             package_path: Full path to package directory
@@ -186,39 +330,140 @@ class ASMExtractor:
             domains: Optional list of domain filters (e.g., ["com.axelor"])
 
         Returns:
-            List of {fqn, uri} dictionaries
+            List of {"class_fqn": str, "symbols": [...], "is_entity": bool}
         """
         try:
-            # Call ASMAnalysisService /index endpoint (lightweight)
-            payload = {"packageRoots": [package_path]}
-            if domains:
-                payload["domains"] = domains
+            package_dir = Path(package_path)
+            classes_dir = package_dir / "classes"
+            sources_dir = package_dir / "sources"
 
-            response = requests.post(
-                f"{self.service_url}/index",
-                json=payload,
-                timeout=300
-            )
-            response.raise_for_status()
-            result = response.json()
+            if not classes_dir.exists():
+                print(f"[ASM]   Warning: classes/ not found in {package_path}")
+                return {}
 
-            if not result.get('success'):
-                print(f"[ASM]   Warning: indexing failed for {package_name}")
-                return []
+            # Get all .class files
+            all_class_files = list(classes_dir.rglob("*.class"))
+            print(f"[ASM]   Found {len(all_class_files)} .class files in {package_name}")
 
-            # Extract symbols (already in correct format)
-            symbols = []
-            for symbol in result.get('symbols', []):
-                symbols.append({
-                    'fqn': symbol['fqn'],
-                    'uri': symbol['uri']
-                })
+            # Filter files that need indexing (deduplication BEFORE analysis)
+            files_to_index = []
+            skipped = 0
 
-            return symbols
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            for class_file in all_class_files:
+                # Calculate relative_uri: com/axelor/db/Model.class
+                relative_uri = str(class_file.relative_to(classes_dir)).replace('\\', '/')
+
+                # Check if already indexed
+                cursor.execute(
+                    "SELECT is_entity FROM symbol_index WHERE relative_uri = ?",
+                    (relative_uri,)
+                )
+                existing = cursor.fetchone()
+
+                if existing:
+                    is_entity = existing[0]
+                    if not is_entity:
+                        # Already indexed and NOT an entity → SKIP
+                        skipped += 1
+                        continue
+                    # else: is_entity = True → re-index (can be overridden)
+
+                # New file or entity to override → add to indexing queue
+                files_to_index.append(class_file)
+
+            conn.close()
+
+            print(f"[ASM]   Deduplication: {len(files_to_index)} to index, {skipped} skipped")
+
+            # Index each file individually via /index endpoint
+            # Service returns grouped symbols with class_fqn and is_entity
+            classes_list = []
+            symbol_count = 0
+
+            for i, class_file in enumerate(files_to_index):
+                if i % 100 == 0 and i > 0:
+                    print(f"[ASM]   Indexing progress: {i}/{len(files_to_index)}")
+
+                try:
+                    # Call /index with single classFile
+                    response = requests.post(
+                        f"{self.service_url}/index",
+                        json={"classFile": str(class_file)},
+                        timeout=10
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+
+                    if not result.get('success'):
+                        continue
+
+                    # Skip enums (service returns skipped=true)
+                    if result.get('skipped'):
+                        continue
+
+                    # Service already grouped symbols by class
+                    class_fqn = result.get('class_fqn')
+                    is_entity = result.get('is_entity', False)
+                    symbols = result.get('symbols', [])
+
+                    if not class_fqn:
+                        continue
+
+                    # Create class entry with URI-enriched symbols
+                    class_entry = {
+                        'class_fqn': class_fqn,
+                        'is_entity': is_entity,
+                        'symbols': []
+                    }
+
+                    # Build URIs for each symbol
+                    for symbol in symbols:
+                        fqn = symbol['fqn']
+                        node_type = symbol.get('nodeType', 'class')
+                        line = symbol.get('line')
+
+                        # Extract class FQN from method FQN
+                        if node_type == 'method':
+                            symbol_class_fqn = fqn.rsplit('.', 1)[0] if '.' in fqn else fqn
+                        else:
+                            symbol_class_fqn = fqn
+
+                        # Build relative URI ONLY for classes
+                        relative_uri = None
+                        if node_type != 'method':
+                            relative_uri = symbol_class_fqn.replace('.', '/') + '.class'
+
+                        # Build source file URI
+                        relative_path = symbol_class_fqn.replace('.', '/') + '.java'
+                        source_file = sources_dir / relative_path
+                        uri = source_file.resolve().as_uri()
+                        if node_type == 'method' and line is not None:
+                            uri = f"{uri}:{line}"
+
+                        symbol_count += 1
+                        class_entry['symbols'].append({
+                            'fqn': fqn,
+                            'uri': uri,
+                            'relative_uri': relative_uri,
+                            'is_entity': is_entity,  # Service already set this
+                            'line': line
+                        })
+
+                    classes_list.append(class_entry)
+
+                except Exception as e:
+                    print(f"[ASM]   Warning: failed to index {class_file.name}: {e}")
+                    continue
+
+            print(f"[ASM]   Indexed {symbol_count} symbols from {len(files_to_index)} files ({len(classes_list)} classes)")
+            return classes_list
 
         except Exception as e:
             print(f"[ASM]   Error indexing {package_name}: {e}")
-            return []
+            return {}
 
     def _compute_package_hash(self, classes_dir: Path) -> str:
         """
@@ -277,34 +522,60 @@ class ASMExtractor:
         stored_hash = row['content_hash']
         return current_hash != stored_hash  # Reindex if hash changed
 
-    def _store_symbols(self, symbols: List[Dict], package_name: str, content_hash: str):
+    def _store_symbols(self, classes_list: List[Dict], package_name: str) -> int:
         """
-        Store symbols in symbol_index table and update metadata
+        Store symbols from classes_list in symbol_index table
+
+        Deduplication is already done in _index_package() before calling this method.
+        We only receive:
+        - New classes/methods
+        - Entity classes that need to be overridden
+
+        Strategy: INSERT OR REPLACE for all symbols (classes and methods) using batches
 
         Args:
-            symbols: List of {fqn, uri}
+            classes_list: List of {'class_fqn': str, 'is_entity': bool, 'symbols': [...]}
             package_name: Package name with version
-            content_hash: SHA256 hash of package content
+
+        Returns:
+            Total number of symbols stored
         """
         cursor = self.conn.cursor()
+        BATCH_SIZE = 5000
 
-        # Delete old symbols for this package
-        cursor.execute("DELETE FROM symbol_index WHERE package = ?", (package_name,))
+        try:
+            cursor.execute("BEGIN")
 
-        # Insert new symbols
-        for symbol in symbols:
-            cursor.execute(
-                "INSERT OR REPLACE INTO symbol_index (fqn, uri, package) VALUES (?, ?, ?)",
-                (symbol['fqn'], symbol['uri'], package_name)
-            )
+            # Collect all rows first
+            rows = []
+            for class_entry in classes_list:
+                symbols = class_entry.get('symbols', [])
 
-        # Update metadata
-        cursor.execute(
-            "INSERT OR REPLACE INTO index_metadata (package, content_hash, indexed_at) VALUES (?, ?, ?)",
-            (package_name, content_hash, datetime.now().isoformat())
-        )
+                for symbol in symbols:
+                    fqn = symbol['fqn']
+                    uri = symbol['uri']
+                    relative_uri = symbol['relative_uri']
+                    is_entity = symbol.get('is_entity', False)
+                    line = symbol.get('line')
 
-        self.conn.commit()
+                    rows.append((fqn, uri, package_name, relative_uri, is_entity, line))
+
+            # Insert by batches of 5000
+            total_symbols = len(rows)
+            for i in range(0, total_symbols, BATCH_SIZE):
+                batch = rows[i:i + BATCH_SIZE]
+                cursor.executemany(
+                    "INSERT OR REPLACE INTO symbol_index (fqn, uri, package, relative_uri, is_entity, line) VALUES (?, ?, ?, ?, ?, ?)",
+                    batch
+                )
+
+            self.conn.commit()
+            print(f"[ASM]   Stored {total_symbols} symbols")
+            return total_symbols
+
+        except Exception as e:
+            self.conn.rollback()
+            raise Exception(f"Failed to store symbols for {package_name}: {e}")
 
     def _fix_local_package_uris(self, project_root: str, local_packages: List[str]):
         """
@@ -327,47 +598,53 @@ class ASMExtractor:
 
         cursor = self.conn.cursor()
 
-        for package_name in local_packages:
-            # Extract module name from package (e.g., "vpauto-8.2.9" -> "vpauto")
-            module_name = re.match(r'^(.+?)-[\d.]+', package_name)
-            if not module_name:
-                print(f"[ASM] Warning: Could not extract module name from {package_name}")
-                continue
+        try:
+            cursor.execute("BEGIN")
 
-            module_name = module_name.group(1)
-            module_path = modules_dir / module_name
+            for package_name in local_packages:
+                # Extract module name from package (e.g., "vpauto-8.2.9" -> "vpauto")
+                module_name = re.match(r'^(.+?)-[\d.]+', package_name)
+                if not module_name:
+                    print(f"[ASM] Warning: Could not extract module name from {package_name}")
+                    continue
 
-            if not module_path.exists():
-                print(f"[ASM] Warning: Module directory not found: {module_path}")
-                continue
+                module_name = module_name.group(1)
+                module_path = modules_dir / module_name
 
-            # Get all symbols for this package
-            cursor.execute("SELECT fqn, uri FROM symbol_index WHERE package = ?", (package_name,))
-            symbols = cursor.fetchall()
+                if not module_path.exists():
+                    print(f"[ASM] Warning: Module directory not found: {module_path}")
+                    continue
 
-            if not symbols:
-                continue
+                # Get all symbols for this package
+                cursor.execute("SELECT fqn, uri FROM symbol_index WHERE package = ?", (package_name,))
+                symbols = cursor.fetchall()
 
-            print(f"[ASM] Fixing {len(symbols)} URIs for {package_name} -> modules/{module_name}")
+                if not symbols:
+                    continue
 
-            updated = 0
-            for symbol in symbols:
-                fqn = symbol['fqn']
-                old_uri = symbol['uri']
+                print(f"[ASM] Fixing {len(symbols)} URIs for {package_name} -> modules/{module_name}")
 
-                # Build new URI pointing to project sources
-                new_uri = self._build_local_uri(fqn, module_path)
+                updated = 0
+                for symbol in symbols:
+                    fqn = symbol['fqn']
+                    old_uri = symbol['uri']
 
-                if new_uri and new_uri != old_uri:
-                    cursor.execute(
-                        "UPDATE symbol_index SET uri = ? WHERE fqn = ? AND package = ?",
-                        (new_uri, fqn, package_name)
-                    )
-                    updated += 1
+                    # Build new URI pointing to project sources
+                    new_uri = self._build_local_uri(fqn, module_path)
 
-            print(f"[ASM]   -> Updated {updated} URIs")
+                    if new_uri and new_uri != old_uri:
+                        cursor.execute(
+                            "UPDATE symbol_index SET uri = ? WHERE fqn = ? AND package = ?",
+                            (new_uri, fqn, package_name)
+                        )
+                        updated += 1
 
-        self.conn.commit()
+                print(f"[ASM]   -> Updated {updated} URIs")
+
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            raise Exception(f"Failed to fix local package URIs: {e}")
 
     def _build_local_uri(self, fqn: str, module_path: Path) -> Optional[str]:
         """
@@ -420,29 +697,60 @@ class ASMExtractor:
 
     def _discover_class_files(self, root_packages: List[Dict], limit: int = None):
         """
-        Generator that discovers .class files from root packages
+        Generator that discovers .class files from root packages,
+        filtering by relative_uri from symbol_index
 
         Args:
             root_packages: List of dicts with 'name' and 'path' keys
-            limit: Optional limit of total files across all packages
+            limit: Optional limit of files PER PACKAGE (not total)
 
         Yields:
             Absolute path to .class file
         """
-        count = 0
+        cursor = self.conn.cursor()
+
         for pkg in root_packages:
+            package_name = pkg['name']
             package_path = Path(pkg['path'])
 
             if not package_path.exists():
                 continue
 
-            # Find all .class files
+            # Find all .class files (limit per package)
+            count = 0
+            skipped = 0
             for class_file in package_path.rglob('*.class'):
-                yield str(class_file.resolve())
-                count += 1
+                # Build relative_uri from file path
+                # e.g., /path/to/axelor-core/classes/com/axelor/db/Model.class
+                #    -> com/axelor/db/Model.class
+                try:
+                    class_file_str = str(class_file).replace('\\', '/')
 
-                if limit and count >= limit:
-                    return
+                    # Check if this .class file path ends with a relative_uri from this package
+                    cursor.execute(
+                        "SELECT 1 FROM symbol_index WHERE package = ? AND ? LIKE '%' || relative_uri",
+                        (package_name, class_file_str)
+                    )
+                    result = cursor.fetchone()
+
+                    if result:
+                        # This .class file was selected during deduplication for this package
+                        yield str(class_file.resolve())
+                        count += 1
+
+                        if limit and count >= limit:
+                            break  # Move to next package
+                    else:
+                        # Skip this .class file (duplicate - selected from another package)
+                        skipped += 1
+
+                except Exception as e:
+                    # If we can't determine relative_uri, skip the file
+                    print(f"[ASM]   Warning: Could not process {class_file}: {e}")
+                    continue
+
+            if skipped > 0:
+                print(f"[ASM]   Skipped {skipped} duplicate class files from {package_name}")
 
     def extract(self, root_packages: List[Dict], project_root: str, domains: List[str] = None, limit: int = None) -> Dict:
         """
@@ -453,7 +761,7 @@ class ASMExtractor:
                           e.g., [{'name': 'axelor-core-7.2.6', 'path': '/path/to/classes'}]
             project_root: Path to project root (for URI resolution)
             domains: Optional list of domain filters (e.g., ["com.axelor"])
-            limit: Optional limit of total files across all packages
+            limit: Optional limit of files PER PACKAGE (not total)
 
         Returns:
             Extraction statistics
@@ -463,7 +771,36 @@ class ASMExtractor:
         if domains:
             print(f"[ASM] Domain filter: {', '.join(domains)}")
         if limit:
-            print(f"[ASM] Limit: {limit} files total")
+            print(f"[ASM] Limit: {limit} files per package")
+
+        # Cache checking: filter packages that need extraction
+        filtered_packages = []
+        skipped = 0
+
+        for pkg in root_packages:
+            pkg_name = pkg['name']
+            # pkg['path'] points to classes/ directory, get parent for package_dir
+            package_dir = Path(pkg['path']).parent
+
+            # Check if package needs extraction
+            if not self._needs_reindex(pkg_name, package_dir):
+                skipped += 1
+                print(f"[ASM] Skipping {pkg_name} (unchanged)")
+                continue
+
+            # Keep this package for extraction
+            # Note: cleaning is already done in build_symbol_index()
+            filtered_packages.append(pkg)
+
+        if skipped > 0:
+            print(f"[ASM] {skipped} package(s) skipped (unchanged)")
+
+        # Use filtered packages for extraction
+        root_packages = filtered_packages
+
+        if not root_packages:
+            print("[ASM] All packages unchanged, nothing to extract")
+            return {'success': True, 'stats': {'total_classes': 0, 'total_methods': 0, 'total_calls': 0, 'skipped_packages': skipped}}
 
         # Discover .class files
         class_files = list(self._discover_class_files(root_packages, limit))
@@ -484,9 +821,11 @@ class ASMExtractor:
 
         # Group by package for progress reporting
         pkg_files = {}
+        pkg_name_to_dir = {}  # Mapping for hash updates
         for pkg in root_packages:
             pkg_path = pkg['path'].replace('/', '\\')  # Normalize to Windows backslashes
             pkg_files[pkg['name']] = [f for f in class_files if f.startswith(pkg_path)]
+            pkg_name_to_dir[pkg['name']] = Path(pkg['path']).parent
 
         for pkg_name, files in pkg_files.items():
             if not files:
@@ -531,6 +870,22 @@ class ASMExtractor:
 
                 print(f"[ASM]   -> {pkg_classes} classes, {pkg_methods} methods, {pkg_calls} calls")
 
+                # Update cache metadata (to skip this package next time)
+                package_dir = pkg_name_to_dir.get(pkg_name)
+                if package_dir:
+                    content_hash = self._compute_package_hash(package_dir / "classes")
+                    cursor = self.conn.cursor()
+                    try:
+                        cursor.execute("BEGIN")
+                        cursor.execute(
+                            "INSERT OR REPLACE INTO index_metadata (package, content_hash, indexed_at) VALUES (?, ?, ?)",
+                            (pkg_name, content_hash, datetime.now().isoformat())
+                        )
+                        self.conn.commit()
+                    except Exception as e:
+                        self.conn.rollback()
+                        print(f"[WARNING] Failed to update metadata for {pkg_name}: {e}")
+
                 # Update progress
                 files_processed += len(files)
 
@@ -562,6 +917,28 @@ class ASMExtractor:
                 'total_calls': total_calls
             }
         }
+
+    def _extract_visibility(self, modifiers: List[str]) -> str:
+        """
+        Extract visibility from modifiers list
+
+        Args:
+            modifiers: List of modifiers like ['public', 'static', 'final']
+
+        Returns:
+            'public', 'private', 'protected', or 'package' (default)
+        """
+        if not modifiers:
+            return 'package'
+
+        if 'public' in modifiers:
+            return 'public'
+        elif 'private' in modifiers:
+            return 'private'
+        elif 'protected' in modifiers:
+            return 'protected'
+        else:
+            return 'package'
 
     def _store_extraction_results(self, package_name: str, classes: List[Dict]):
         """Store extraction results in database (without URIs - resolved at query time)"""
@@ -618,8 +995,11 @@ class ASMExtractor:
             class_fqn = class_data['fqn']
             class_package = fqn_to_package.get(class_fqn)
 
-            # Add class node (no line for classes)
-            nodes_batch.append((class_fqn, 'class', class_package, None))
+            # Extract visibility from class modifiers
+            class_visibility = self._extract_visibility(class_data.get('modifiers', []))
+
+            # Add class node (no line, no annotations for classes)
+            nodes_batch.append((class_fqn, 'class', class_package, None, class_visibility, None, None))
 
             # Process inheritances as edges (edge_type='inheritance', kind='extends'/'implements')
             for inheritance in class_data.get('inheritance', []):
@@ -642,9 +1022,15 @@ class ASMExtractor:
                 method_fqn = method['fqn']
                 method_package = fqn_to_package.get(method_fqn)
 
-                # Add method node with line number
+                # Extract method metadata
                 method_line = method.get('lineNumber')
-                nodes_batch.append((method_fqn, 'method', method_package, method_line))
+                method_visibility = self._extract_visibility(method.get('modifiers', []))
+                method_has_override = method.get('hasOverride', False)
+                method_is_transactional = method.get('isTransactional', False)
+
+                # Add method node with all metadata
+                nodes_batch.append((method_fqn, 'method', method_package, method_line,
+                                  method_visibility, method_has_override, method_is_transactional))
 
                 # Add member_of edge (method belongs to class) - edge_type='member_of', kind='method'
                 edges_batch.append((method_fqn, 'member_of', class_fqn, 'method', method_package, class_package, None))
@@ -670,21 +1056,36 @@ class ASMExtractor:
                     if target_package:
                         edges_batch.append((method_fqn, 'call', target_fqn, call_kind, method_package, target_package, call_line))
 
-        # Batch insert nodes
+        # Batch insert nodes in chunks of 5000 with commit per batch
+        BATCH_SIZE = 5000
         if nodes_batch:
-            cursor.executemany(
-                "INSERT OR IGNORE INTO nodes (fqn, type, package, line) VALUES (?, ?, ?, ?)",
-                nodes_batch
-            )
+            for i in range(0, len(nodes_batch), BATCH_SIZE):
+                batch = nodes_batch[i:i + BATCH_SIZE]
+                try:
+                    cursor.execute("BEGIN")
+                    cursor.executemany(
+                        "INSERT OR IGNORE INTO nodes (fqn, type, package, line, visibility, has_override, is_transactional) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        batch
+                    )
+                    self.conn.commit()  # Commit after each batch
+                except Exception as e:
+                    self.conn.rollback()
+                    raise Exception(f"Failed to insert nodes batch for {package_name}: {e}")
 
-        # Batch insert edges
+        # Batch insert edges in chunks of 5000 with commit per batch
         if edges_batch:
-            cursor.executemany(
-                "INSERT OR IGNORE INTO edges (from_fqn, edge_type, to_fqn, kind, from_package, to_package, from_line) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                edges_batch
-            )
-
-        self.conn.commit()
+            for i in range(0, len(edges_batch), BATCH_SIZE):
+                batch = edges_batch[i:i + BATCH_SIZE]
+                try:
+                    cursor.execute("BEGIN")
+                    cursor.executemany(
+                        "INSERT OR IGNORE INTO edges (from_fqn, edge_type, to_fqn, kind, from_package, to_package, from_line) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        batch
+                    )
+                    self.conn.commit()  # Commit after each batch
+                except Exception as e:
+                    self.conn.rollback()
+                    raise Exception(f"Failed to insert edges batch for {package_name}: {e}")
 
     def extract_project(self, project_root: str, project_package: str, allowed_packages: List[str] = None, modules_base_path: str = None) -> Dict:
         """
@@ -1057,6 +1458,7 @@ class ASMExtractor:
 
     def close(self):
         """Close database connection"""
+        self.conn.commit()  # Final commit before closing
         self.conn.close()
 
 

@@ -25,17 +25,14 @@ The new architecture uses:
 
 **Usage**:
 ```bash
-# Build index only
-python run_asm_extraction.py /path/to/project --index
-
-# Build index + extract call graph
+# Incremental extraction (default, uses cache)
 python run_asm_extraction.py /path/to/project
 
-# Reset database before extraction
-python run_asm_extraction.py /path/to/project --reset
+# Full reset (first time or after schema changes)
+python run_asm_extraction.py /path/to/project --init
 
-# Limit extraction for testing
-python run_asm_extraction.py /path/to/project --limit 100
+# Limit extraction for testing (requires --init to avoid partial data)
+python run_asm_extraction.py /path/to/project --init --limit 100
 ```
 
 **Key Features**:
@@ -44,17 +41,23 @@ python run_asm_extraction.py /path/to/project --limit 100
 - Progress tracking with ETA
 - Package filtering (local vs Axelor)
 
+**Modes**:
+- **Incremental (default)**: Smart caching with SHA256 - only re-extracts modified packages
+- **--init**: Full reset - drops all tables and rebuilds from scratch
+
 **Architecture**:
 ```python
 main()
-  ├── Parse args (--index, --reset, --limit)
+  ├── Parse args (--init, --limit)
   ├── Step 1: GradleDependencyManager.get_dependencies()
   │   └── Returns: {packages: [...], classpath: [...]}
   │
-  ├── Step 2 (if --index): ASMExtractor.build_symbol_index()
-  │   └── Builds FQN → URI mapping for all Axelor packages
+  ├── Step 2: ASMExtractor.build_symbol_index() [ALWAYS runs]
+  │   ├── If --init: extractor.init_database() (drop all tables)
+  │   ├── Else: auto_init=True (create tables if needed)
+  │   └── Builds FQN → URI mapping with auto-clean for modified packages
   │
-  └── Step 3: ASMExtractor.extract()
+  └── Step 3: ASMExtractor.extract() [ALWAYS runs]
       └── Extracts call graph from .class files
 ```
 
@@ -140,8 +143,9 @@ deps = manager.get_dependencies()
 -- Symbol index (FQN → URI → package)
 CREATE TABLE symbol_index (
     fqn TEXT PRIMARY KEY,          -- Fully Qualified Name
-    uri TEXT NOT NULL,              -- file:/// URI to source
-    package TEXT NOT NULL           -- Package name (e.g., "axelor-core-7.2.6")
+    uri TEXT NOT NULL,              -- file:/// URI to source (file:///.../File.java:42 for methods)
+    package TEXT NOT NULL,          -- Package name (e.g., "axelor-core-7.2.6")
+    line INTEGER                    -- Line number (methods only)
 );
 
 -- Index metadata (for cache invalidation)
@@ -157,6 +161,9 @@ CREATE TABLE nodes (
     type TEXT NOT NULL,             -- 'class', 'interface', 'enum', 'method'
     package TEXT NOT NULL,
     line INTEGER,
+    visibility TEXT,                -- 'public', 'private', 'protected', 'package'
+    has_override BOOLEAN,           -- TRUE if @Override annotation present (methods only)
+    is_transactional BOOLEAN,       -- TRUE if @Transactional annotation present (methods only)
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -178,9 +185,13 @@ CREATE TABLE edges (
 ```python
 from ASMExtractor import ASMExtractor
 
-extractor = ASMExtractor(db_path=".callgraph.db")
+# Incremental mode (default)
+extractor = ASMExtractor(db_path=".callgraph.db")  # init=False by default
 
-# Step 1: Build symbol index
+# OR: INIT mode (full reset)
+extractor = ASMExtractor(db_path=".callgraph.db", init=True)  # Automatically drops and recreates all tables
+
+# Step 1: Build symbol index (with auto-clean)
 extractor.build_symbol_index(
     axelor_repos_dir="axelor-repos",
     packages=["axelor-core-7.2.6", "axelor-base-8.2.9"],
@@ -188,6 +199,7 @@ extractor.build_symbol_index(
     project_root="/path/to/project",
     local_packages=["vpauto-8.2.9"]
 )
+# → Automatically calls clean_package_data() for each modified package
 
 # Step 2: Extract call graph
 root_packages = [
@@ -205,9 +217,29 @@ extractor.close()
 
 **Key Methods**:
 
+#### `__init__(db_path, service_url, init=False)`
+- **init=False (default)**: Incremental mode - creates tables if they don't exist
+- **init=True**: INIT mode - drops and recreates all tables (full reset)
+
+#### `init_database()`
+- **Full reset for INIT mode**
+- Drops all existing tables (symbol_index, index_metadata, nodes, edges)
+- Recreates all tables from scratch
+- Use for: first-time setup, schema changes, or with --init flag
+
+#### `clean_package_data(package_name)`
+- **Incremental cleanup**
+- Removes all data for a specific package:
+  - Symbols from `symbol_index`
+  - Nodes (classes/methods) from `nodes`
+  - Edges where from_package OR to_package matches
+  - Metadata to force re-indexing
+- Called automatically by `build_symbol_index()` for modified packages
+
 #### `build_symbol_index()`
 - Calls `ASMAnalysisService POST /index` for each package
 - Computes SHA256 hash of .class files
+- **Automatically calls `clean_package_data()` before re-indexing**
 - Skips reindexing if hash unchanged (cache invalidation)
 - Fixes URIs for local packages (points to project sources)
 
@@ -215,7 +247,13 @@ extractor.close()
 - Discovers .class files from `root_packages`
 - Calls `ASMAnalysisService POST /analyze` per package
 - Batch resolves packages via `symbol_index`
-- Stores results in `nodes` and `edges` tables
+- Stores results in `nodes` and `edges` tables with enriched metadata:
+  - Visibility (public, private, protected, package)
+  - Annotations (@Override, @Transactional)
+
+#### `_extract_visibility(modifiers)`
+- Extracts visibility from ASM modifiers list
+- Returns 'public', 'private', 'protected', or 'package' (default)
 
 #### `_fix_local_package_uris()`
 - Replaces `axelor-repos/` URIs with project source URIs
@@ -228,7 +266,8 @@ extractor.close()
 **Performance**:
 - Symbol indexing: ~10-20 seconds for 39 packages (90k symbols)
 - Call graph extraction: ~5-10 minutes for 3000 .class files
-- Caching: Skips unchanged packages (huge speedup for iterative development)
+- **Incremental mode**: Only re-extracts modified packages (70%+ speedup)
+- **INIT mode**: Full extraction from scratch (use for schema changes)
 
 ---
 
@@ -254,7 +293,8 @@ Health check endpoint
 ```
 
 #### `POST /index` (Lightweight)
-Extract symbols only (FQN + package) for indexing
+Extract symbols (FQN + package + nodeType + line) for indexing.
+Indexes **both classes AND methods** (not just classes).
 
 **Request**:
 ```json
@@ -272,7 +312,15 @@ Extract symbols only (FQN + package) for indexing
   "symbols": [
     {
       "fqn": "com.axelor.db.Model",
-      "package": "axelor-core-7.2.6"
+      "package": "axelor-core-7.2.6",
+      "nodeType": "class",
+      "line": null
+    },
+    {
+      "fqn": "com.axelor.db.Model.getId()",
+      "package": "axelor-core-7.2.6",
+      "nodeType": "method",
+      "line": 42
     }
   ]
 }
@@ -337,6 +385,20 @@ Or with explicit class files:
 }
 ```
 
+#### `POST /shutdown`
+Gracefully shut down the ASM Analysis Service
+
+**Request**: No body required
+
+**Response**:
+```json
+{
+  "status": "shutting down"
+}
+```
+
+The service will stop after sending the response (500ms delay to ensure response delivery).
+
 **Key Features**:
 
 1. **ClassAnalyzer** (ASM ClassVisitor):
@@ -364,11 +426,17 @@ Or with explicit class files:
 ```bash
 cd Extracteurs/ASMAnalysisService
 ./gradlew.bat run
+# Service logs to asm-service.log in the current directory
 
 # Or build JAR
 ./gradlew.bat build
 java -jar build/libs/ASMAnalysisService-1.0.0.jar
 ```
+
+**Logging**:
+- Logs are written to `asm-service.log` in the working directory
+- Log level: INFO by default
+- Spark/Jetty logs are suppressed to reduce noise
 
 ---
 
@@ -378,7 +446,7 @@ java -jar build/libs/ASMAnalysisService-1.0.0.jar
 
 ```
 1. run_asm_extraction.py
-   └── Parse args: /path/to/project --index --reset
+   └── Parse args: /path/to/project --init
 
 2. GradleDependencyManager
    ├── Run: gradlew --init-script list-dependencies.gradle listAxelorDeps
@@ -388,10 +456,19 @@ java -jar build/libs/ASMAnalysisService-1.0.0.jar
 
    Returns: {packages: [...], classpath: [...]}
 
-3. ASMExtractor.build_symbol_index() [if --index]
+3. ASMExtractor initialization
+   ├── If --init: init=True → init_database() called automatically (drop all tables)
+   └── Else: init=False (default) → create tables if not exist
+
+4. ASMExtractor.build_symbol_index() [ALWAYS runs]
    For each package:
      ├── Compute SHA256(classes/*.class)
      ├── Check index_metadata: needs_reindex?
+     ├── If modified: clean_package_data(package_name)
+     │   ├── DELETE FROM symbol_index WHERE package = ?
+     │   ├── DELETE FROM nodes WHERE package = ?
+     │   ├── DELETE FROM edges WHERE from_package = ? OR to_package = ?
+     │   └── DELETE FROM index_metadata WHERE package = ?
      ├── POST /index → ASMAnalysisService
      │   └── Returns: [{fqn, package}]
      ├── Store in symbol_index
@@ -400,20 +477,26 @@ java -jar build/libs/ASMAnalysisService-1.0.0.jar
    For local packages:
      └── Fix URIs: axelor-repos → project/modules/
 
-4. ASMExtractor.extract()
+5. ASMExtractor.extract() [ALWAYS runs]
    For each package:
      ├── Discover .class files
      ├── POST /analyze → ASMAnalysisService
      │   └── ClassAnalyzer (ASM)
      │       ├── visit() → class node + inheritance edges
      │       ├── visitField() → field edges
-     │       └── visitMethod() → method node + call edges
+     │       └── visitMethod(modifiers) → method node
+     │           ├── visitAnnotation() → detect @Override, @Transactional
+     │           └── visitMethodInsn() → method call edges
+     ├── Extract visibility from modifiers
      ├── Batch lookup packages via symbol_index
-     └── Store in nodes + edges tables
+     └── Store in nodes + edges tables with metadata:
+         - visibility (public, private, protected, package)
+         - has_override (boolean)
+         - is_transactional (boolean)
 
-5. Database: .callgraph.db
+6. Database: .callgraph.db
    ├── symbol_index: 90k symbols
-   ├── nodes: classes + methods
+   ├── nodes: classes + methods + metadata
    └── edges: calls + inheritance + member_of
 ```
 
@@ -494,11 +577,11 @@ ORDER BY symbol_count DESC;
 
 ## Future Improvements
 
-1. **Incremental extraction**: Only analyze changed .class files
-2. **Parallel analysis**: Multi-threaded ASMAnalysisService
-3. **Source map integration**: Better URI resolution for Gradle builds
-4. **Graph algorithms**: PageRank, centrality analysis
-5. **MCP server integration**: Direct SQLite queries from Claude Code
+1. **Parallel analysis**: Multi-threaded ASMAnalysisService for faster extraction
+2. **Source map integration**: Better URI resolution for Gradle builds
+3. **Graph algorithms**: PageRank, centrality analysis for impact metrics
+4. **Advanced query tools**: Pre-built SQL queries for common analysis patterns
+5. **Change tracking**: Git-aware incremental extraction based on file modifications
 
 ---
 

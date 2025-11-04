@@ -22,16 +22,20 @@ def main():
     parser = argparse.ArgumentParser(description='ASM-based CallGraph Extraction Tool')
     parser.add_argument('repo_path', type=str,
                        help='Path to the repository')
-    parser.add_argument('--index', action='store_true',
-                       help='Build symbol index only (skip extraction)')
-    parser.add_argument('--reset', action='store_true',
-                       help='Clear nodes and edges tables before extraction')
+    parser.add_argument('--init', action='store_true',
+                       help='Full reset: clear all tables and rebuild from scratch (ignores cache)')
     parser.add_argument('--limit', type=int, default=None,
-                       help='Limit extraction to N files per package')
+                       help='Limit extraction to N files per package (for testing, requires --init)')
     parser.add_argument('--log', type=str, default=None,
                        help='Path to log file (default: asm_extraction_YYYYMMDD_HHMMSS.log)')
 
     args = parser.parse_args()
+
+    # Validate arguments
+    if args.limit and not args.init:
+        print("Error: --limit can only be used with --init (to avoid partial data in incremental mode)")
+        print("Usage: python run_asm_extraction.py <repo_path> --init --limit <N>")
+        sys.exit(1)
 
     # Resolve paths
     repo_path = Path(args.repo_path).resolve()
@@ -67,13 +71,10 @@ def main():
     log_print(f"Log file: {log_file}")
     log_print("=" * 60)
     log_print(f"Repository: {repo_path}")
-    log_print(f"Mode: {'INDEX ONLY' if args.index else 'INDEX + EXTRACT'}")
+    log_print(f"Mode: {'INIT (full reset)' if args.init else 'INCREMENTAL (cache enabled)'}")
 
-    if not args.index:
-        if args.reset:
-            log_print("Reset: Clear nodes and edges tables")
-        if args.limit:
-            log_print(f"Limit: {args.limit} files per package")
+    if args.limit:
+        log_print(f"Limit: {args.limit} files per package")
     log_print("")
 
     # Step 1: Always run GradleDependencyManager to discover packages
@@ -85,88 +86,64 @@ def main():
     dep_manager = GradleDependencyManager(str(repo_path))
     deps = dep_manager.get_dependencies()
 
-    axelor_packages = deps['packages']
+    packages = deps['packages']
     local_packages = []
 
-    # Identify local packages
-    modules_dir = repo_path / "modules"
-    if modules_dir.exists():
-        for module in modules_dir.iterdir():
-            if module.is_dir():
-                module_name = module.name
-                for pkg in axelor_packages:
-                    if pkg['name'].startswith(module_name + '-'):
-                        local_packages.append(pkg['name'])
-                        break
+    # Identify local packages (packages without sources JAR available)
+    # External Axelor packages have sources in Maven, local ones don't
+    for pkg in packages:
+        sources_path = pkg.get('sources')
+        # No sources available OR sources directory doesn't exist
+        if not sources_path or not Path(sources_path).exists():
+            local_packages.append(pkg['name'])
 
-    log_print(f"Found {len(axelor_packages)} Axelor packages")
-    log_print(f"Found {len(local_packages)} local packages: {local_packages}")
+    log_print(f"Found {len(packages)} packages total")
+    if local_packages:
+        log_print(f"  -> Including {len(local_packages)} local packages: {local_packages}")
     log_print("")
 
-    # Step 2: Build index (only if --index flag)
+    # Step 2: Initialize database and build symbol index
     db_path = repo_path / ".callgraph.db"
+    log_print("")
+    log_print("[STEP 2] Building symbol index...")
+    log_print("-" * 60)
 
-    if args.index:
-        log_print("")
-        log_print("[STEP 2] Building symbol index...")
-        log_print("-" * 60)
-        from ASMExtractor import ASMExtractor
+    from ASMExtractor import ASMExtractor
 
-        extractor = ASMExtractor(db_path=str(db_path))
+    # Initialize extractor with appropriate mode
+    if args.init:
+        log_print("INIT mode: Full database reset...")
+        extractor = ASMExtractor(db_path=str(db_path), init=True)
+    else:
+        log_print("INCREMENTAL mode: Using cache (will auto-clean modified packages)")
+        extractor = ASMExtractor(db_path=str(db_path))  # init=False by default
 
-        # Clear symbol index
-        cursor = extractor.conn.cursor()
-        cursor.execute("DELETE FROM symbol_index")
-        cursor.execute("DELETE FROM index_metadata")
-        extractor.conn.commit()
-        log_print("Symbol index cleared")
+    # Build index from packages
+    # Gradle puts LOCAL packages first, then dependencies (base packages last)
+    # We need the REVERSE order for indexing: base packages first, locals last
+    axelor_repos_dir = dep_manager.axelor_repos_dir
+    package_names = [pkg['name'] for pkg in reversed(packages)]
 
-        # Build index from packages
-        axelor_repos_dir = dep_manager.axelor_repos_dir
-        package_names = [pkg['name'] for pkg in axelor_packages]
-        extractor.build_symbol_index(
-            axelor_repos_dir=str(axelor_repos_dir),
-            packages=package_names,
-            domains=["com.axelor"],
-            project_root=str(repo_path),
-            local_packages=local_packages
-        )
-        extractor.close()
+    extractor.build_symbol_index(
+        axelor_repos_dir=str(axelor_repos_dir),
+        packages=package_names,
+        domains=["com.axelor"],
+        project_root=str(repo_path),
+        local_packages=local_packages
+    )
 
-        log_print("Symbol index complete")
-
-    # If --index only, stop here
-    if args.index:
-        log_print("")
-        log_print("=" * 60)
-        log_print("INDEX COMPLETE")
-        log_print("=" * 60)
-        log_print(f"Database: {db_path}")
-        log_print(f"Finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        log_handle.close()
-        return
+    log_print("Symbol index complete")
 
     # Step 3: Extract call graph from all packages
     log_print("")
     log_print("[STEP 3] Extracting call graph...")
     log_print("-" * 60)
 
-    from ASMExtractor import ASMExtractor
-    extractor = ASMExtractor(db_path=str(db_path))
-
-    # Reset nodes and edges if requested
-    if args.reset:
-        log_print("Clearing nodes and edges tables...")
-        cursor = extractor.conn.cursor()
-        cursor.execute("DELETE FROM nodes")
-        cursor.execute("DELETE FROM edges")
-        extractor.conn.commit()
-
     # Build rootPackages list (paths to classes/ directories)
-    axelor_repos = Path(dep_manager.axelor_repos_dir)
     root_packages = []
-    for pkg in axelor_packages:
-        pkg_classes = axelor_repos / pkg['name'] / 'classes'
+    for pkg in packages:
+        # Use the 'classes' path provided by GradleDependencyManager
+        pkg_classes = Path(pkg['classes'])
         if pkg_classes.exists():
             root_packages.append({
                 'name': pkg['name'],
